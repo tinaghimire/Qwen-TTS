@@ -24,12 +24,23 @@ def main():
     device = "cuda:0"
     MODEL_PATH = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/"
 
-    tts = Qwen3TTSModel.from_pretrained(
-        MODEL_PATH,
-        device_map=device,
-        dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    )
+    try:
+        tts = Qwen3TTSModel.from_pretrained(
+            MODEL_PATH,
+            device_map=device,
+            dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        )
+        print(f"✓ Model loaded with flash_attention_2")
+    except (ImportError, Exception) as e:
+        print(f"⚠ Flash attention not available, falling back to SDPA: {e}")
+        tts = Qwen3TTSModel.from_pretrained(
+            MODEL_PATH,
+            device_map=device,
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+        print(f"✓ Model loaded with SDPA")
 
     # -------- Single (with instruct) --------
     torch.cuda.synchronize()

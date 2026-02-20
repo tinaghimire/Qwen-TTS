@@ -125,13 +125,23 @@ def get_model(model_size: str = DEFAULT_MODEL_SIZE) -> Qwen3TTSModel:
     global _model
     if _model is None:
         model_path = snapshot_download(f"Qwen/Qwen3-TTS-12Hz-{model_size}-Base")
-        _model = Qwen3TTSModel.from_pretrained(
-            model_path,
-            device_map="cuda",
-            dtype=torch.bfloat16,
-            attn_implementation="kernels-community/flash-attn3",
-        )
-        print(f"✓ Model loaded: {model_size}")
+        try:
+            _model = Qwen3TTSModel.from_pretrained(
+                model_path,
+                device_map="cuda",
+                dtype=torch.bfloat16,
+                attn_implementation="kernels-community/flash-attn3",
+            )
+            print(f"✓ Model loaded: {model_size} (with flash attention)")
+        except (ImportError, Exception) as e:
+            print(f"⚠ Flash attention not available, falling back to SDPA: {e}")
+            _model = Qwen3TTSModel.from_pretrained(
+                model_path,
+                device_map="cuda",
+                dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+            )
+            print(f"✓ Model loaded: {model_size} (with SDPA)")
     return _model
 
 

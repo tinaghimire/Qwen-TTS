@@ -58,13 +58,23 @@ def prepare_hausa_data(
         ref_text = "MTN Entertainment and Lifestyle. Entertainment and Lifestyle are at the heart of MTN's offering. We bring you music, movies, games and more through our digital platforms. With MTN musicals, you can stream your favorite"
     
     print(f"Loading Qwen3-TTS model from {model_path}...")
-    model = Qwen3TTSModel.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    )
-    model = model.to(device)
-    model.eval()
+    try:
+        model = Qwen3TTSModel.from_pretrained(
+            model_path,
+            device_map=device,
+            dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        )
+        print(f"✓ Model loaded with flash_attention_2")
+    except (ImportError, Exception) as e:
+        print(f"⚠ Flash attention not available, falling back to SDPA: {e}")
+        model = Qwen3TTSModel.from_pretrained(
+            model_path,
+            device_map=device,
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+        print(f"✓ Model loaded with SDPA")
     
     print(f"Loading Hausa TTS dataset ({split} split)...")
     hf_dataset = load_dataset("vaghawan/hausa-tts-22k", split=split)

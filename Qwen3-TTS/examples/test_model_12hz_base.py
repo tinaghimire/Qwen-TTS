@@ -45,12 +45,23 @@ def main():
     OUT_DIR = "qwen3_tts_test_voice_clone_output_wav"
     ensure_dir(OUT_DIR)
 
-    tts = Qwen3TTSModel.from_pretrained(
-        MODEL_PATH,
-        device_map=device,
-        dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    )
+    try:
+        tts = Qwen3TTSModel.from_pretrained(
+            MODEL_PATH,
+            device_map=device,
+            dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        )
+        print(f"✓ Model loaded with flash_attention_2")
+    except (ImportError, Exception) as e:
+        print(f"⚠ Flash attention not available, falling back to SDPA: {e}")
+        tts = Qwen3TTSModel.from_pretrained(
+            MODEL_PATH,
+            device_map=device,
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+        print(f"✓ Model loaded with SDPA")
 
     # Reference audio(s)
     ref_audio_path_1 = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"

@@ -119,11 +119,23 @@ class HausaTTSTrainer:
         
         # Load model and config
         print(f"Loading model from {args.init_model_path}...")
-        self.qwen3tts = Qwen3TTSModel.from_pretrained(
-            args.init_model_path,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-        )
+        try:
+            self.qwen3tts = Qwen3TTSModel.from_pretrained(
+                args.init_model_path,
+                device_map="cuda",
+                dtype=torch.bfloat16,
+                attn_implementation="flash_attention_2",
+            )
+            print(f"✓ Model loaded with flash_attention_2")
+        except (ImportError, Exception) as e:
+            print(f"⚠ Flash attention not available, falling back to SDPA: {e}")
+            self.qwen3tts = Qwen3TTSModel.from_pretrained(
+                args.init_model_path,
+                device_map="cuda",
+                dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+            )
+            print(f"✓ Model loaded with SDPA")
         self.config = AutoConfig.from_pretrained(args.init_model_path)
         
         # Create datasets

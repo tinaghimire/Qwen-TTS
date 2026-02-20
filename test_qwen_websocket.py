@@ -83,10 +83,18 @@ class AudioAnalyzer:
         mfcc1 = AudioAnalyzer.extract_mfcc(audio1, sr)
         mfcc2 = AudioAnalyzer.extract_mfcc(audio2, sr)
         
+        # Handle different lengths by using the minimum length
+        min_frames = min(mfcc1.shape[1], mfcc2.shape[1])
+        if min_frames == 0:
+            return 0.0
+        
+        mfcc1_trimmed = mfcc1[:, :min_frames]
+        mfcc2_trimmed = mfcc2[:, :min_frames]
+        
         # Compute cosine similarity for each MFCC coefficient
         similarities = []
-        for i in range(mfcc1.shape[0]):
-            sim = 1 - cosine(mfcc1[i], mfcc2[i])
+        for i in range(mfcc1_trimmed.shape[0]):
+            sim = 1 - cosine(mfcc1_trimmed[i], mfcc2_trimmed[i])
             similarities.append(sim)
         
         # Average similarity across all coefficients
@@ -99,10 +107,18 @@ class AudioAnalyzer:
         chroma1 = librosa.feature.chroma_stft(y=audio1, sr=sr)
         chroma2 = librosa.feature.chroma_stft(y=audio2, sr=sr)
         
+        # Handle different lengths by using the minimum length
+        min_frames = min(chroma1.shape[1], chroma2.shape[1])
+        if min_frames == 0:
+            return 0.0
+        
+        chroma1_trimmed = chroma1[:, :min_frames]
+        chroma2_trimmed = chroma2[:, :min_frames]
+        
         # Compute cosine similarity
         similarities = []
-        for i in range(chroma1.shape[0]):
-            sim = 1 - cosine(chroma1[i], chroma2[i])
+        for i in range(chroma1_trimmed.shape[0]):
+            sim = 1 - cosine(chroma1_trimmed[i], chroma2_trimmed[i])
             similarities.append(sim)
         
         return float(np.mean(similarities))

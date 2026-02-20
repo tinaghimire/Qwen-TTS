@@ -45,11 +45,21 @@ def train():
 
     MODEL_PATH = args.init_model_path
 
-    qwen3tts = Qwen3TTSModel.from_pretrained(
-        MODEL_PATH,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    )
+    try:
+        qwen3tts = Qwen3TTSModel.from_pretrained(
+            MODEL_PATH,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        )
+        print(f"✓ Model loaded with flash_attention_2")
+    except (ImportError, Exception) as e:
+        print(f"⚠ Flash attention not available, falling back to SDPA: {e}")
+        qwen3tts = Qwen3TTSModel.from_pretrained(
+            MODEL_PATH,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+        print(f"✓ Model loaded with SDPA")
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
     train_data = open(args.train_jsonl).readlines()
