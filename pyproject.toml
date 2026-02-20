@@ -20,11 +20,20 @@ dependencies = [
     "einops>=0.6.0",
     "sox>=1.4.1",
     "onnxruntime>=1.16.0",
+    "datasets>=2.14.0",
 ]
 
 [build-system]
 requires = ["setuptools>=70.0.0", "wheel", "ninja"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = []
+
+[tool.setuptools.packages.find]
+where = ["Qwen3-TTS"]
+include = ["qwen_tts*"]
+exclude = ["tests*", "examples*"]
 
 [[tool.uv.index]]
 name = "pytorch"
@@ -44,3 +53,4 @@ dev = [
 flash-attn = [
     "flash-attn>=2.6.0",
 ]
+
