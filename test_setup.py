@@ -124,7 +124,7 @@ def main():
         print()
         print("You can now run:")
         print("  uv run qwen_tts_server.py")
-        print("  uv run test_qwen_websocket.py --voice reference.wav")
+        print("  uv run test_qwen_websocket.py --voice reference")
         return 0
     else:
         print("✗ Setup incomplete!")
