@@ -32,6 +32,7 @@ A comprehensive WebSocket server for Qwen3-TTS voice cloning with support for Ha
 - **Flexible training** with evaluation
 - **Model upload** to Hugging Face Hub
 - **Mixed precision training** support
+- **Environment variable configuration** for reproducibility
 
 ## 🔧 Prerequisites
 
@@ -65,144 +66,46 @@ pip install --index-url https://download.pytorch.org/whl/cu130 torch torchaudio
 # Install other dependencies
 pip install fastapi uvicorn websockets librosa scipy numpy soundfile \
     huggingface_hub transformers==4.57.3 accelerate==1.12.0 \
-    einops sox onnxruntime datasets>=2.14.0
+    einops sox onnxruntime datasets>=2.14.0 python-dotenv
 
 # Install flash-attn (optional, for faster inference)
 pip install flash-attn --no-build-isolation
 ```
 
+### Setup Environment Configuration
+
+```bash
+# Create .env file from example template
+python setup_env.py
+
+# Or manually copy
+cp .env.training.example .env
+
+# Edit .env with your configuration
+nano .env  # or your preferred editor
+```
+
+### Verify Installation
+
+```bash
+# Run tests to verify everything is set up correctly
+python test_setup.py
+```
+
 ## 🚀 Quick Start
 
-### 1. Start the WebSocket Server
-
 ```bash
-# Default settings (port 8000, model size 1.7B)
-uv run qwen_tts_server.py
+# Setup environment
+python setup_env.py
 
-# Custom settings
-uv run qwen_tts_server.py --host 0.0.0.0 --port 8001 --model-size 0.6B
-```
+# Verify installation
+python test_setup.py
 
-### 2. Test the Server
-
-```bash
-# Run all tests
-uv run test_qwen_websocket.py --voice english_voice
-
-# Run specific test
-uv run test_qwen_websocket.py --voice english_voice --test basic
-```
-
-### 3. Train on Hausa TTS Data
-
-```bash
 # Simple training (recommended for beginners)
-python train_simple.py --batch_size 2 --lr 2e-5 --num_epochs 3
+python train_using_sft.py
 
 # Advanced training (with validation and WandB)
-python train_advanced.py --batch_size 2 --lr 2e-5 --num_epochs 3 --use_wandb
-```
-
-## 🌐 WebSocket Server
-
-### Voice Setup
-
-Create a directory for each voice in the `voices/` folder:
-
-```bash
-mkdir -p voices/english_voice
-cp /path/to/reference.wav voices/english_voice/
-```
-
-**Supported audio formats**: `.wav`, `.mp3`, `.flac`, `.ogg`, `.m4a`, `.aac`
-
-### Endpoints
-
-#### 1. Standard WebSocket Endpoint
-
-```
-ws://localhost:8000/ws/voice-clone/{voice_id}
-```
-
-**Protocol:**
-```json
-// Client sends config (optional)
-{"type": "config", "language": "Auto", "use_xvector_only": false, "model_size": "1.7B"}
-
-// Client sends text to synthesize
-{"type": "text", "text": "Hello world", "ref_text": "optional reference text"}
-
-// Client sends end signal
-{"type": "end"}
-
-// Server responds with audio
-{
-  "type": "audio",
-  "audio": "<base64_wav>",
-  "sample_rate": 24000,
-  "generation_time": 1.23,
-  "audio_duration": 2.45,
-  "real_time_factor": 1.99
-}
-```
-
-#### 2. ElevenLabs-Compatible Endpoint
-
-```
-ws://localhost:8000/v1/text-to-speech/{voice_id}/stream-input
-```
-
-**Protocol:**
-```json
-// Initialization
-{"text": " ", "generation_config": {"language": "Auto", "use_xvector_only": true}}
-
-// Stream text
-{"text": "Hello world."}
-
-// Close
-{"text": ""}
-
-// Server response
-{"audio": "<base64_pcm_wav>", "isFinal": false}
-// Final
-{"isFinal": true}
-```
-
-#### 3. HTTP Endpoint
-
-```
-POST /voice-clone/{voice_id}
-Content-Type: application/json
-
-{
-  "target_text": "Hello world",
-  "ref_text": "optional reference text",
-  "language": "Auto",
-  "use_xvector_only": false,
-  "model_size": "1.7B"
-}
-```
-
-**Response:** WAV audio file with timing headers:
-- `X-Generation-Time`: Time taken to generate audio (seconds)
-- `X-Audio-Duration`: Duration of generated audio (seconds)
-- `X-Sample-Rate`: Sample rate (Hz)
-
-#### 4. List Voices Endpoint
-
-```
-GET /voices
-```
-
-**Response:**
-```json
-{
-  "voices": [
-    {"id": "english_voice", "audio_file": "english_voice/english_voice.wav"}
-  ],
-  "count": 1
-}
+python train_wandb_validation.py
 ```
 
 ## 🎯 Training Pipeline
@@ -211,11 +114,69 @@ GET /voices
 
 Train Qwen3-TTS on the Hausa TTS dataset from Hugging Face for voice cloning in Hausa language.
 
+All training is configured via environment variables in the `.env` file for reproducibility and easy configuration management.
+
 ### Dataset
 
 - **Source**: `vaghawan/hausa-tts-22k`
 - **Splits**: train, validation, test
 - **Features**: audio, text, speaker_id, language, gender, age_range, phase
+
+### Environment Configuration
+
+The `.env` file controls all training parameters. Here's a summary of the key variables:
+
+```bash
+# Device and Model
+DEVICE=cuda
+INIT_MODEL_PATH=Qwen/Qwen3-TTS-12Hz-1.7B-Base
+OUTPUT_MODEL_PATH=./output
+
+# Dataset
+DATASET_NAME=vaghawan/hausa-tts-22k
+TRAIN_JSONL=./data/train.jsonl
+VALIDATION_JSONL=./data/validation.jsonl
+MAX_TRAIN_SAMPLES=
+MAX_EVAL_SAMPLES=
+
+# Training Hyperparameters
+BATCH_SIZE=2
+LR=2e-5
+NUM_EPOCHS=3
+WEIGHT_DECAY=0.01
+WARMUP_STEPS=100
+GRADIENT_ACCUMULATION_STEPS=4
+MAX_GRAD_NORM=1.0
+
+# Speaker Configuration
+SPEAKER_NAME=hausa_speaker
+REF_AUDIO_PATH=/path/to/reference/audio.wav
+REF_TEXT="Your reference text here..."
+
+# WandB (Advanced Training)
+USE_WANDB=true
+WANDB_PROJECT=qwen3-tts-hausa
+WANDB_RUN_NAME=
+
+# Hugging Face Hub (Advanced Training)
+UPLOAD_TO_HUB=false
+HUB_MODEL_ID_BEST=vaghawan/tts-best
+HUB_MODEL_ID_LAST=vaghawan/tts-last
+HF_TOKEN=hf_your_token_here
+
+# Logging and Checkpointing (Advanced Training)
+LOGGING_STEPS=10
+SAVE_STEPS=500
+EVAL_STEPS=500
+SAVE_TOTAL_LIMIT=3
+
+# Mixed Precision
+MIXED_PRECISION=bf16
+
+# Workflow Control
+SKIP_PREPARE=false
+PREPARE_ONLY=false
+```
 
 ### Training Options
 
@@ -224,17 +185,20 @@ Train Qwen3-TTS on the Hausa TTS dataset from Hugging Face for voice cloning in 
 Uses `sft_12hz.py` directly - perfect for quick experiments.
 
 ```bash
-# Train with default settings
-python train_simple.py
+# Train with settings from .env
+python train_using_sft.py
 
-# Custom settings
-python train_simple.py --batch_size 4 --lr 1e-5 --num_epochs 5
+# Edit .env to change settings, then train again
+nano .env
+python train_using_sft.py
 
 # Skip data preparation if already done
-python train_simple.py --skip_prepare
+echo "SKIP_PREPARE=true" >> .env
+python train_using_sft.py
 
 # Only prepare data, don't train
-python train_simple.py --prepare_only
+echo "PREPARE_ONLY=true" >> .env
+python train_using_sft.py
 ```
 
 #### Option 2: Advanced Training (Production Ready)
@@ -242,20 +206,21 @@ python train_simple.py --prepare_only
 Includes validation, metrics, WandB logging, and model checkpointing.
 
 ```bash
-# Train with default settings (includes WandB)
-python train_advanced.py
+# Train with settings from .env (includes WandB by default)
+python train_wandb_validation.py
 
-# Train with custom settings
-python train_advanced.py --batch_size 4 --lr 1e-5 --num_epochs 5 --use_wandb
+# Disable WandB - edit .env:
+echo "USE_WANDB=false" >> .env
+python train_wandb_validation.py
 
-# Train without WandB
-python train_advanced.py --use_wandb False
-
-# Upload models to Hugging Face Hub
-python train_advanced.py --upload_to_hub --hub_token YOUR_TOKEN
+# Enable model upload to Hugging Face - edit .env:
+echo "UPLOAD_TO_HUB=true" >> .env
+echo "HF_TOKEN=hf_your_token_here" >> .env
+python train_wandb_validation.py
 
 # Skip data preparation if already done
-python train_advanced.py --skip_prepare
+echo "SKIP_PREPARE=true" >> .env
+python train_wandb_validation.py
 ```
 
 #### Option 3: Dataset Preparation Only
@@ -273,6 +238,82 @@ python dataset_tool.py --dataset_name vaghawan/hausa-tts-22k --split train --max
 # Get dataset info
 python dataset_tool.py --info ./data/train.jsonl
 ```
+
+### Environment Variable Reference
+
+#### Core Configuration
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DEVICE` | string | `cuda` | Device to use (cuda/cpu) |
+| `INIT_MODEL_PATH` | string | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Initial model path |
+| `OUTPUT_MODEL_PATH` | string | `./output` | Output model path |
+| `OUTPUT_DIR` | string | `./output` | Output directory (advanced) |
+| `TOKENIZER_PATH` | string | `Qwen/Qwen3-TTS-Tokenizer-12Hz` | Tokenizer path |
+
+#### Dataset Configuration
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DATASET_NAME` | string | `vaghawan/hausa-tts-22k` | Hugging Face dataset name |
+| `TRAIN_JSONL` | string | `./data/train.jsonl` | Training data path |
+| `VALIDATION_JSONL` | string | `./data/validation.jsonl` | Validation data path |
+| `MAX_TRAIN_SAMPLES` | int | None | Max training samples |
+| `MAX_EVAL_SAMPLES` | int | None | Max validation samples |
+
+#### Training Hyperparameters
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `BATCH_SIZE` | int | `2` | Batch size |
+| `LR` | float | `2e-5` | Learning rate |
+| `NUM_EPOCHS` | int | `3` | Number of epochs |
+| `WEIGHT_DECAY` | float | `0.01` | Weight decay |
+| `WARMUP_STEPS` | int | `100` | Warmup steps |
+| `GRADIENT_ACCUMULATION_STEPS` | int | `4` | Gradient accumulation |
+| `MAX_GRAD_NORM` | float | `1.0` | Max gradient norm |
+
+#### Speaker Configuration
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `SPEAKER_NAME` | string | `hausa_speaker` | Speaker name |
+| `REF_AUDIO_PATH` | string | (default) | Reference audio path |
+| `REF_TEXT` | string | (default) | Reference text |
+
+#### WandB Configuration (Advanced)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `USE_WANDB` | bool | `true` | Enable WandB |
+| `WANDB_PROJECT` | string | `qwen3-tts-hausa` | WandB project |
+| `WANDB_RUN_NAME` | string | None | Custom run name |
+
+#### Hugging Face Configuration (Advanced)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `UPLOAD_TO_HUB` | bool | `false` | Upload to Hub |
+| `HUB_MODEL_ID_BEST` | string | `vaghawan/tts-best` | Best model repo |
+| `HUB_MODEL_ID_LAST` | string | `vaghawan/tts-last` | Last model repo |
+| `HF_TOKEN` | string | None | Hugging Face token |
+
+#### Logging & Checkpointing (Advanced)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `LOGGING_STEPS` | int | `10` | Logging frequency |
+| `SAVE_STEPS` | int | `500` | Save frequency |
+| `EVAL_STEPS` | int | `500` | Eval frequency |
+| `SAVE_TOTAL_LIMIT` | int | `3` | Max checkpoints |
+
+#### Workflow Control
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `SKIP_PREPARE` | bool | `false` | Skip data prep |
+| `PREPARE_ONLY` | bool | `false` | Only prep data |
+| `MIXED_PRECISION` | string | `bf16` | Precision mode |
 
 ### Dataset Tool Features
 
@@ -311,62 +352,6 @@ info = get_dataset_info("./data/train.jsonl")
 print(f"Languages: {info['languages']}")
 print(f"Speakers: {info['speakers']}")
 ```
-
-### Command Line Arguments
-
-#### Dataset Tool (`dataset_tool.py`)
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--dataset_name` | str | `vaghawan/hausa-tts-22k` | Hugging Face dataset name |
-| `--split` | str | `train` | Dataset split (train, validation, test) |
-| `--output_jsonl` | str | `./data/{split}.jsonl` | Output JSONL file path |
-| `--model_path` | str | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Path to Qwen3-TTS model |
-| `--ref_audio_path` | str | `voices/english_voice/english_voice.wav` | Reference audio path |
-| `--ref_text` | str | MTN Entertainment... | Reference text |
-| `--max_samples` | int | None | Maximum samples to process |
-| `--device` | str | `cuda` | Device (cuda/cpu) |
-| `--info` | str | None | Get info about JSONL dataset |
-
-#### Simple Training (`train_simple.py`)
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--dataset_name` | str | `vaghawan/hausa-tts-22k` | Hugging Face dataset name |
-| `--train_jsonl` | str | `./data/train.jsonl` | Training data JSONL |
-| `--validation_jsonl` | str | `None` | Validation data JSONL |
-| `--init_model_path` | str | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Initial model path |
-| `--output_model_path` | str | `./output` | Output directory |
-| `--batch_size` | int | `2` | Batch size |
-| `--lr` | float | `2e-5` | Learning rate |
-| `--num_epochs` | int | `3` | Number of epochs |
-| `--speaker_name` | str | `hausa_speaker` | Speaker name |
-| `--max_train_samples` | int | None | Max training samples |
-| `--max_eval_samples` | int | None | Max evaluation samples |
-| `--skip_prepare` | flag | False | Skip data preparation |
-| `--prepare_only` | flag | False | Only prepare data |
-
-#### Advanced Training (`train_advanced.py`)
-
-All simple training options plus:
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--gradient_accumulation_steps` | int | `4` | Gradient accumulation steps |
-| `--weight_decay` | float | `0.01` | Weight decay |
-| `--warmup_steps` | int | `100` | Warmup steps |
-| `--max_grad_norm` | float | `1.0` | Max gradient norm |
-| `--logging_steps` | int | `10` | Logging frequency |
-| `--save_steps` | int | `500` | Checkpoint save frequency |
-| `--eval_steps` | int | `500` | Evaluation frequency |
-| `--use_wandb` | flag | True | Use WandB logging |
-| `--wandb_project` | str | `qwen3-tts-hausa` | WandB project name |
-| `--wandb_run_name` | str | None | WandB run name |
-| `--upload_to_hub` | flag | False | Upload to Hugging Face |
-| `--hub_model_id_best` | str | `vaghawan/tts-best` | Best model repo ID |
-| `--hub_model_id_last` | str | `vaghawan/tts-last` | Last model repo ID |
-| `--hub_token` | str | None | Hugging Face token |
-| `--mixed_precision` | str | `bf16` | Mixed precision mode |
 
 ### Output Structure
 
@@ -433,6 +418,7 @@ sf.write("output.wav", output.audio, output.sampling_rate)
 | Mixed Precision | Default | Configurable |
 | Gradient Accumulation | ❌ | ✅ |
 | Best Model Saving | ❌ | ✅ |
+| Env Config | ✅ | ✅ |
 
 ### Use Cases
 
@@ -450,97 +436,67 @@ sf.write("output.wav", output.audio, output.sampling_rate)
 - Need checkpoint management
 - Want to upload to Hub
 
-## 📚 API Documentation
+### Typical Workflow
 
-Once the server is running, visit:
-- **Swagger UI**: `http://localhost:8000/docs`
-- **ReDoc**: `http://localhost:8000/redoc`
+1. **Setup** (one-time):
+   ```bash
+   python setup_env.py          # Create .env file
+   nano .env                     # Edit configuration
+   python test_setup.py          # Verify setup
+   ```
 
-## 🧪 Testing
+2. **Experiment** (development):
+   ```bash
+   # Edit .env to set small fast config
+   echo "BATCH_SIZE=4" >> .env
+   echo "NUM_EPOCHS=1" >> .env
+   echo "MAX_TRAIN_SAMPLES=100" >> .env
+   
+   # Run simple training
+   python train_using_sft.py
+   ```
 
-### Run All Tests
+3. **Production** (final training):
+   ```bash
+   # Edit .env for production config
+   echo "BATCH_SIZE=2" >> .env
+   echo "NUM_EPOCHS=10" >> .env
+   echo "USE_WANDB=true" >> .env
+   echo "UPLOAD_TO_HUB=true" >> .env
+   
+   # Run advanced training
+   python train_wandb_validation.py
+   ```
+
+## 🔧 Helper Scripts
+
+### setup_env.py
+
+Creates a `.env` file from `.env.training.example` template.
 
 ```bash
-uv run test_qwen_websocket.py --voice english_voice
+python setup_env.py
 ```
 
-### Run Specific Tests
+### test_setup.py
+
+Verifies that your environment is correctly configured.
 
 ```bash
-# Basic connection test
-uv run test_qwen_websocket.py --voice english_voice --test basic
-
-# Streaming test
-uv run test_qwen_websocket.py --voice english_voice --test streaming
-
-# Audio similarity test
-uv run test_qwen_websocket.py --voice english_voice --test similarity
-
-# ElevenLabs-compatible test
-uv run test_qwen_websocket.py --voice english_voice --test elevenlabs
+python test_setup.py
 ```
 
-### Test Output
+### dataset_tool.py
 
-All test outputs are saved to the `test_output/` directory:
+Unified interface for dataset operations.
 
-- `test1_basic_output.wav` - Basic test output
-- `test2_chunk_*.wav` - Streaming test chunks
-- `test3_generated.wav` - Audio similarity test output
-- `test4_el_chunk_*.wav` - ElevenLabs-compatible test chunks
-- `test_results.json` - Comprehensive test results
+```bash
+# Prepare data
+python dataset_tool.py --dataset_name vaghawan/hausa-tts-22k --split train
 
-### Understanding Test Results
-
-#### Timing Statistics
-
-- **Generation Time**: Time taken to generate audio
-- **Audio Duration**: Length of generated audio
-- **Real-Time Factor (RTF)**: `audio_duration / generation_time`
-  - RTF > 1.0: Faster than real-time (good)
-  - RTF < 1.0: Slower than real-time
-
-#### Audio Similarity Scores
-
-- **MFCC Similarity**: Based on Mel-frequency cepstral coefficients
-- **Spectral Similarity**: Based on chroma spectral features
-
-Both scores range from 0 (dissimilar) to 1 (identical).
-
-Quality interpretation:
-- **Excellent**: > 0.7
-- **Good**: 0.5 - 0.7
-- **Fair**: 0.3 - 0.5
-- **Poor**: < 0.3
-
-## 🔍 Troubleshooting
-
-### Server won't start
-- Check if port is already in use: `lsof -i :8000`
-- Ensure CUDA is available: `python -c "import torch; print(torch.cuda.is_available())"`
-
-### WebSocket connection fails
-- Verify server is running: `curl http://localhost:8000/health`
-- Check firewall settings
-- Ensure voice directory exists in `voices/` directory
-- List available voices: `curl http://localhost:8000/voices`
-
-### Audio generation errors
-- Check reference audio format (should be WAV, mono)
-- Verify reference text matches audio content (for ICL mode)
-- Check GPU memory: `nvidia-smi`
-
-### Training issues
-- **Out of Memory**: Reduce `--batch_size` or use `--max_samples` for testing
-- **Slow Training**: Increase `--batch_size` if memory allows
-- **Dataset Not Found**: Ensure you have internet connection and `vaghawan/hausa-tts-22k` exists on Hugging Face
-
-### Similarity scores are low
-- Ensure reference audio is clear and has good quality
-- Use longer reference audio (5-10 seconds recommended)
-- Check that reference text accurately transcribes the audio
-
-## 📄 License
+# Get info
+python dataset_tool.py --info ./data/train.jsonl
+```
 
 This code follows the same license as Qwen3-TTS (Apache-2.0).
 

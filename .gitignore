@@ -60,3 +60,6 @@ huggingface/
 *.tmp
 *.bak
 *.swp
+
+# Environment configuration (contains sensitive data)
+.env

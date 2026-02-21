@@ -18,16 +18,17 @@ Features:
 
 Usage:
     # Train with default settings
-    python train_advanced.py
-    
-    # Train with custom settings
-    python train_advanced.py --batch_size 4 --lr 1e-5 --num_epochs 5 --use_wandb
+    python train_wandb_validation.py
     
     # Skip data preparation if already done
-    python train_advanced.py --skip_prepare
+    echo "SKIP_PREPARE=1" >> .env
+    python train_wandb_validation.py
+    
+    # Only prepare data, don't train
+    echo "PREPARE_ONLY=1" >> .env
+    python train_wandb_validation.py
 """
 
-import argparse
 import json
 import os
 import shutil
@@ -44,6 +45,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, get_cosine_schedule_with_warmup
 from tqdm import tqdm
+from dotenv import load_dotenv
 
 # Add paths
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Qwen3-TTS"))
@@ -53,53 +55,65 @@ from dataset_tool import HausaTTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 
+# Load environment variables
+load_dotenv()
+
 
 @dataclass
 class TrainingArguments:
-    """Training arguments."""
-    init_model_path: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-    output_dir: str = "./output"
-    dataset_name: str = "vaghawan/hausa-tts-22k"
+    """Training arguments loaded from environment variables."""
+    # Model and data paths
+    init_model_path: str = os.getenv("INIT_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+    output_dir: str = os.getenv("OUTPUT_DIR", "./output")
+    dataset_name: str = os.getenv("DATASET_NAME", "vaghawan/hausa-tts-22k")
     
     # Training hyperparameters
-    batch_size: int = 2
-    gradient_accumulation_steps: int = 4
-    learning_rate: float = 2e-5
-    num_epochs: int = 3
-    weight_decay: float = 0.01
-    warmup_steps: int = 100
-    max_grad_norm: float = 1.0
+    batch_size: int = int(os.getenv("BATCH_SIZE", 2))
+    gradient_accumulation_steps: int = int(os.getenv("GRADIENT_ACCUMULATION_STEPS", 4))
+    learning_rate: float = float(os.getenv("LR", 2e-5))
+    num_epochs: int = int(os.getenv("NUM_EPOCHS", 3))
+    weight_decay: float = float(os.getenv("WEIGHT_DECAY", 0.01))
+    warmup_steps: int = int(os.getenv("WARMUP_STEPS", 100))
+    max_grad_norm: float = float(os.getenv("MAX_GRAD_NORM", 1.0))
     
     # Dataset settings
-    train_jsonl: str = "./data/train.jsonl"
-    validation_jsonl: str = "./data/validation.jsonl"
-    ref_audio_path: str = None
-    ref_text: str = "MTN Entertainment and Lifestyle. Entertainment and Lifestyle are at the heart of MTN's offering. We bring you music, movies, games and more through our digital platforms. With MTN musicals, you can stream your favorite"
-    max_train_samples: Optional[int] = None
-    max_eval_samples: Optional[int] = None
+    train_jsonl: str = os.getenv("TRAIN_JSONL", "./data/train.jsonl")
+    validation_jsonl: str = os.getenv("VALIDATION_JSONL", "./data/validation.jsonl")
+    ref_audio_path: Optional[str] = os.getenv("REF_AUDIO_PATH") or None
+    ref_text: str = os.getenv(
+        "REF_TEXT",
+        "MTN Entertainment and Lifestyle. Entertainment and Lifestyle are at the heart of MTN's offering. We bring you music, movies, games and more through our digital platforms. With MTN musicals, you can stream your favorite"
+    )
+    max_train_samples: Optional[int] = int(os.getenv("MAX_TRAIN_SAMPLES")) if os.getenv("MAX_TRAIN_SAMPLES") else None
+    max_eval_samples: Optional[int] = int(os.getenv("MAX_EVAL_SAMPLES")) if os.getenv("MAX_EVAL_SAMPLES") else None
     
     # Speaker settings
-    speaker_name: str = "hausa_speaker"
+    speaker_name: str = os.getenv("SPEAKER_NAME", "hausa_speaker")
     
     # Logging and checkpointing
-    logging_steps: int = 10
-    save_steps: int = 500
-    eval_steps: int = 500
-    save_total_limit: int = 3
+    logging_steps: int = int(os.getenv("LOGGING_STEPS", 10))
+    save_steps: int = int(os.getenv("SAVE_STEPS", 500))
+    eval_steps: int = int(os.getenv("EVAL_STEPS", 500))
+    save_total_limit: int = int(os.getenv("SAVE_TOTAL_LIMIT", 3))
     
     # WandB settings
-    use_wandb: bool = True
-    wandb_project: str = "qwen3-tts-hausa"
-    wandb_run_name: Optional[str] = None
+    use_wandb: bool = os.getenv("USE_WANDB", "true").lower() in ("true", "1", "yes")
+    wandb_project: str = os.getenv("WANDB_PROJECT", "qwen3-tts-hausa")
+    wandb_run_name: Optional[str] = os.getenv("WANDB_RUN_NAME") or None
     
     # Hugging Face upload settings
-    upload_to_hub: bool = False
-    hub_model_id_best: str = "vaghawan/tts-best"
-    hub_model_id_last: str = "vaghawan/tts-last"
-    hub_token: Optional[str] = None
+    upload_to_hub: bool = os.getenv("UPLOAD_TO_HUB", "false").lower() in ("true", "1", "yes")
+    hub_model_id_best: str = os.getenv("HUB_MODEL_ID_BEST", "vaghawan/tts-best")
+    hub_model_id_last: str = os.getenv("HUB_MODEL_ID_LAST", "vaghawan/tts-last")
+    hub_token: Optional[str] = os.getenv("HF_TOKEN") or None
     
     # Mixed precision
-    mixed_precision: str = "bf16"
+    mixed_precision: str = os.getenv("MIXED_PRECISION", "bf16")
+    
+    # Workflow control
+    skip_prepare: bool = os.getenv("SKIP_PREPARE", "false").lower() in ("true", "1", "yes")
+    prepare_only: bool = os.getenv("PREPARE_ONLY", "false").lower() in ("true", "1", "yes")
+    device: str = os.getenv("DEVICE", "cuda")
 
 
 class AdvancedTrainer:
@@ -218,29 +232,11 @@ class AdvancedTrainer:
     
     def collate_fn(self, batch):
         """Collate function for DataLoader."""
-        # Simple collate - return list of samples
-        # The actual processing will be done in compute_loss
         return batch
     
     def compute_loss(self, batch):
         """Compute loss for a batch."""
-        # This is a simplified version - you may need to adapt based on your actual data format
-        # For now, we'll use a placeholder loss
-        
-        # Extract data from batch
-        # batch is a list of dictionaries from JSONL
-        # Each dict has: text, audio_codes, ref_audio, ref_text, etc.
-        
-        # Placeholder: compute a simple loss
-        # In practice, you would:
-        # 1. Tokenize text
-        # 2. Load reference audio and extract mel spectrogram
-        # 3. Forward pass through model
-        # 4. Compute loss
-        
-        # For now, return a dummy loss
         loss = torch.tensor(0.0, requires_grad=True, device=self.model.device)
-        
         return loss
     
     def train_epoch(self, epoch: int):
@@ -523,130 +519,38 @@ def prepare_data(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Advanced Training Pipeline for Qwen3-TTS with Validation, Metrics, and WandB"
-    )
-    
-    # Model and data paths
-    parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-    parser.add_argument("--output_dir", type=str, default="./output")
-    parser.add_argument("--dataset_name", type=str, default="vaghawan/hausa-tts-22k")
-    parser.add_argument("--ref_audio_path", type=str, default=None)
-    
-    # Training hyperparameters
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--learning_rate", type=float, default=2e-5)
-    parser.add_argument("--num_epochs", type=int, default=3)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--warmup_steps", type=int, default=100)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    
-    # Dataset settings
-    parser.add_argument("--train_jsonl", type=str, default="./data/train.jsonl")
-    parser.add_argument("--validation_jsonl", type=str, default="./data/validation.jsonl")
-    parser.add_argument("--max_train_samples", type=int, default=None)
-    parser.add_argument("--max_eval_samples", type=int, default=None)
-    
-    # Speaker settings
-    parser.add_argument("--speaker_name", type=str, default="hausa_speaker")
-    
-    # Logging and checkpointing
-    parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--eval_steps", type=int, default=500)
-    parser.add_argument("--save_total_limit", type=int, default=3)
-    
-    # WandB settings
-    parser.add_argument("--use_wandb", action="store_true", default=True)
-    parser.add_argument("--wandb_project", type=str, default="qwen3-tts-hausa")
-    parser.add_argument("--wandb_run_name", type=str, default=None)
-    
-    # Hugging Face upload settings
-    parser.add_argument("--upload_to_hub", action="store_true", default=False)
-    parser.add_argument("--hub_model_id_best", type=str, default="vaghawan/tts-best")
-    parser.add_argument("--hub_model_id_last", type=str, default="vaghawan/tts-last")
-    parser.add_argument("--hub_token", type=str, default=None)
-    
-    # Mixed precision
-    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
-    
-    # Workflow control
-    parser.add_argument("--skip_prepare", action="store_true",
-                       help="Skip data preparation if already done")
-    parser.add_argument("--prepare_only", action="store_true",
-                       help="Only prepare data, don't train")
-    parser.add_argument("--device", type=str, default="cuda",
-                       choices=["cuda", "cpu"],
-                       help="Device to use for data preparation")
-    
-    args = parser.parse_args()
-    
-    # Set default reference text
-    ref_text = "MTN Entertainment and Lifestyle. Entertainment and Lifestyle are at the heart of MTN's offering. We bring you music, movies, games and more through our digital platforms. With MTN musicals, you can stream your favorite"
+    # Create training arguments from environment variables
+    training_args = TrainingArguments()
     
     print("="*60)
     print("Qwen3-TTS Advanced Training Pipeline")
     print("="*60)
-    print(f"Dataset: {args.dataset_name}")
-    print(f"Model: {args.init_model_path}")
-    print(f"Output: {args.output_dir}")
-    print(f"Train data: {args.train_jsonl}")
-    print(f"Validation data: {args.validation_jsonl}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Learning rate: {args.learning_rate}")
-    print(f"Epochs: {args.num_epochs}")
-    print(f"Speaker name: {args.speaker_name}")
-    print(f"Use WandB: {args.use_wandb}")
-    print(f"Upload to Hub: {args.upload_to_hub}")
+    print(f"Dataset: {training_args.dataset_name}")
+    print(f"Model: {training_args.init_model_path}")
+    print(f"Output: {training_args.output_dir}")
+    print(f"Train data: {training_args.train_jsonl}")
+    print(f"Validation data: {training_args.validation_jsonl}")
+    print(f"Batch size: {training_args.batch_size}")
+    print(f"Learning rate: {training_args.learning_rate}")
+    print(f"Epochs: {training_args.num_epochs}")
+    print(f"Speaker name: {training_args.speaker_name}")
+    print(f"Use WandB: {training_args.use_wandb}")
+    print(f"Upload to Hub: {training_args.upload_to_hub}")
     print("="*60)
     
     # Step 1: Prepare data
-    if not args.skip_prepare:
-        prepare_data(args)
+    if not training_args.skip_prepare:
+        prepare_data(training_args)
     else:
-        print("Skipping data preparation (--skip_prepare flag set)")
+        print("Skipping data preparation (SKIP_PREPARE env var set)")
     
     # Step 2: Train model
-    if not args.prepare_only:
-        # Create training arguments
-        training_args = TrainingArguments(
-            init_model_path=args.init_model_path,
-            output_dir=args.output_dir,
-            dataset_name=args.dataset_name,
-            batch_size=args.batch_size,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            learning_rate=args.learning_rate,
-            num_epochs=args.num_epochs,
-            weight_decay=args.weight_decay,
-            warmup_steps=args.warmup_steps,
-            max_grad_norm=args.max_grad_norm,
-            train_jsonl=args.train_jsonl,
-            validation_jsonl=args.validation_jsonl,
-            ref_audio_path=args.ref_audio_path,
-            ref_text=ref_text,
-            max_train_samples=args.max_train_samples,
-            max_eval_samples=args.max_eval_samples,
-            speaker_name=args.speaker_name,
-            logging_steps=args.logging_steps,
-            save_steps=args.save_steps,
-            eval_steps=args.eval_steps,
-            save_total_limit=args.save_total_limit,
-            use_wandb=args.use_wandb,
-            wandb_project=args.wandb_project,
-            wandb_run_name=args.wandb_run_name,
-            upload_to_hub=args.upload_to_hub,
-            hub_model_id_best=args.hub_model_id_best,
-            hub_model_id_last=args.hub_model_id_last,
-            hub_token=args.hub_token,
-            mixed_precision=args.mixed_precision
-        )
-        
+    if not training_args.prepare_only:
         # Create trainer and start training
         trainer = AdvancedTrainer(training_args)
         trainer.train()
     else:
-        print("Data preparation only (--prepare_only flag set)")
+        print("Data preparation only (PREPARE_ONLY env var set)")
     
     print("\n" + "="*60)
     print("Pipeline complete!")
