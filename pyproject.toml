@@ -1,28 +1,16 @@
 [project]
-name = "qwen3-tts-websocket"
+name = "qwen3-tts"
 version = "0.1.0"
-description = "WebSocket server and test suite for Qwen3-TTS voice cloning"
+description = "Qwen3-TTS WebSocket server"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
-dependencies = [
-    "fastapi>=0.104.0",
-    "uvicorn[standard]>=0.24.0",
-    "websockets>=12.0",
-    "librosa>=0.10.0",
-    "scipy>=1.11.0",
-    "numpy>=1.24.0",
-    "torch>=2.5.0",
-    "torchaudio>=2.5.0",
-    "soundfile>=0.12.0",
-    "huggingface-hub>=0.19.0",
-    "transformers==4.57.3",
-    "accelerate==1.12.0",
-    "einops>=0.6.0",
-    "sox>=1.4.1",
-    "onnxruntime>=1.16.0",
-    "datasets>=2.14.0",
-    "torchcodec>=0.10.0",
-]
+
+[dependencies]
+fastapi = ">=0.104.0"
+uvicorn = {extras = ["standard"], version = ">=0.24.0"}
+websockets = ">=12.0"
+python-dotenv = ">=1.0.0"
+numpy = ">=1.24.0"
 
 [build-system]
 requires = ["setuptools>=70.0.0", "wheel", "ninja"]
@@ -40,18 +28,3 @@ exclude = ["tests*", "examples*"]
 name = "pytorch"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
-
-[tool.uv.extra-build-dependencies]
-flash-attn = ["torch"]
-
-[dependency-groups]
-dev = [
-    "pytest>=7.4.0",
-    "pytest-asyncio>=0.21.0",
-]
-
-# use uv sync --group flash-attn
-flash-attn = [
-    "flash-attn>=2.6.0",
-]
-
