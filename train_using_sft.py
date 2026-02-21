@@ -17,45 +17,48 @@ def prepare_data(args):
     print("="*60)
     print("Step 1: Preparing Hausa TTS data")
     print("="*60)
-    
-    # Prepare train data
+
+    # Prepare train data using dataset_tool.py
     train_cmd = [
         sys.executable,
-        "prepare_hausa_data.py",
+        "dataset_tool.py",
+        "--dataset_name", args.dataset_name,
         "--split", "train",
         "--output_jsonl", args.train_jsonl,
-        "--model_path", args.init_model_path,
+        "--tokenizer_path", args.tokenizer_path,
         "--ref_audio_path", args.ref_audio_path,
         "--ref_text", args.ref_text,
-        "--max_samples", str(args.max_train_samples) if args.max_train_samples else "None",
         "--device", args.device
     ]
-    
-    # Remove None values
-    train_cmd = [arg for arg in train_cmd if arg != "None"]
-    
+
+    # Add max_samples only if specified
+    if args.max_train_samples is not None:
+        train_cmd.extend(["--max_samples", str(args.max_train_samples)])
+
     print(f"Running: {' '.join(train_cmd)}")
     result = subprocess.run(train_cmd, check=True)
-    
+
     # Prepare validation data if specified
     if args.validation_jsonl:
         val_cmd = [
             sys.executable,
-            "prepare_hausa_data.py",
+            "dataset_tool.py",
+            "--dataset_name", args.dataset_name,
             "--split", "validation",
             "--output_jsonl", args.validation_jsonl,
-            "--model_path", args.init_model_path,
+            "--tokenizer_path", args.tokenizer_path,
             "--ref_audio_path", args.ref_audio_path,
             "--ref_text", args.ref_text,
-            "--max_samples", str(args.max_eval_samples) if args.max_eval_samples else "None",
             "--device", args.device
         ]
-        
-        val_cmd = [arg for arg in val_cmd if arg != "None"]
-        
+
+        # Add max_samples only if specified
+        if args.max_eval_samples is not None:
+            val_cmd.extend(["--max_samples", str(args.max_eval_samples)])
+
         print(f"Running: {' '.join(val_cmd)}")
         result = subprocess.run(val_cmd, check=True)
-    
+
     print("Data preparation complete!")
 
 
@@ -90,10 +93,14 @@ def main():
     )
     
     # Data preparation arguments
+    parser.add_argument("--dataset_name", type=str, default="vaghawan/hausa-tts-22k",
+                       help="Hugging Face dataset name")
     parser.add_argument("--train_jsonl", type=str, default="./data/hausa_train.jsonl",
                        help="Output JSONL file for training data")
     parser.add_argument("--validation_jsonl", type=str, default=None,
                        help="Output JSONL file for validation data (optional)")
+    parser.add_argument("--tokenizer_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz",
+                       help="Path to Qwen3-TTS tokenizer")
     parser.add_argument("--ref_audio_path", type=str, default=None,
                        help="Path to reference audio")
     parser.add_argument("--ref_text", type=str, default=None,
@@ -129,11 +136,11 @@ def main():
     
     args = parser.parse_args()
     
-    # Set default reference audio path
+    # Set default reference audio path (24kHz version)
     if args.ref_audio_path is None:
         args.ref_audio_path = os.path.join(
             os.path.dirname(__file__),
-            "voices", "english_voice", "english_voice.wav"
+            "voices", "english_voice", "english_voice_24k.wav"
         )
     
     # Set default reference text
@@ -143,6 +150,7 @@ def main():
     print("="*60)
     print("Hausa TTS Training Pipeline")
     print("="*60)
+    print(f"Dataset: {args.dataset_name}")
     print(f"Model: {args.init_model_path}")
     print(f"Output: {args.output_model_path}")
     print(f"Train data: {args.train_jsonl}")
