@@ -124,14 +124,14 @@ def test_env_file():
                 return True
             else:
                 print(f"  ⚠ Missing environment variables: {', '.join(missing)}")
-                print(f"    Run: python setup_env.py to create .env file")
+                print(f"    Run: cp .env.training.example .env to create .env file")
                 return False
         except Exception as e:
             print(f"  ✗ Error loading .env: {e}")
             return False
     else:
         print(f"  ⚠ .env file does not exist")
-        print(f"    Run: python setup_env.py to create .env file from .env.training.example")
+        print(f"    Run: cp .env.training.example .env to create .env file")
         return False
 
 
@@ -187,8 +187,9 @@ def main():
         print()
         print("Please run:")
         print("  uv sync                             # Install dependencies")
-        print("  python setup_env.py                 # Create .env file")
-        print("  python test_setup.py                # Re-run this test")
+        print("  cp .env.training.example .env      # Create .env file")
+        print("  nano .env                          # Edit configuration")
+        print("  python test_setup.py               # Re-run this test")
         return 1
 
 
