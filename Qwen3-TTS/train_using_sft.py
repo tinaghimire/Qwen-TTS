@@ -32,7 +32,6 @@ SPEAKER_NAME = os.getenv("SPEAKER_NAME", "reference_speaker")
 MAX_TRAIN_SAMPLES = int(os.getenv("MAX_TRAIN_SAMPLES")) if os.getenv("MAX_TRAIN_SAMPLES") else None
 MAX_EVAL_SAMPLES = int(os.getenv("MAX_EVAL_SAMPLES")) if os.getenv("MAX_EVAL_SAMPLES") else None
 
-
 def prepare_data(train_only=False):
     print("="*60)
     print("Step 1: Preparing Hausa TTS data")
@@ -50,12 +49,16 @@ def prepare_data(train_only=False):
         return
 
     if VALIDATION_JSONL:
+        # Prepare validation data
+        env = os.environ.copy()
+        env["DATASET_SPLIT"] = "validation"
+        env["OUTPUT_JSONL"] = VALIDATION_JSONL
         val_cmd = [
             sys.executable,
             "dataset_tool.py",
         ]
         print(f"Running validation data preparation...")
-        subprocess.run(val_cmd, check=True)
+        subprocess.run(val_cmd, env=env, check=True)
 
     print("Data preparation complete!")
 
@@ -84,6 +87,8 @@ def train_model():
 
 
 def main():
+    global REF_AUDIO_PATH, REF_TEXT
+
     if REF_AUDIO_PATH is None:
         REF_AUDIO_PATH = os.path.join(
             os.path.dirname(__file__),
@@ -94,7 +99,7 @@ def main():
         REF_TEXT = "MTN Entertainment and Lifestyle. Entertainment and Lifestyle are at the heart of MTN's offering. We bring you music, movies, games and more through our digital platforms. With MTN musicals, you can stream your favorite"
 
     if os.getenv("PREPARE_ONLY"):
-        prepare_data(train_only=True)
+        prepare_data()
         print("\n" + "="*60)
         print("Data preparation only (--prepare_only flag set)")
         print("="*60)

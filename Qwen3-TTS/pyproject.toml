@@ -1,34 +1,44 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=70.0.0", "wheel", "ninja"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "qwen-tts"
 version = "0.1.1"
-description = "Qwen-TTS python package"
+description = "Qwen3-TTS python package"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.9,<3.13"
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
 ]
 license = { text = "Apache-2.0" }
 authors = [{ name = "Alibaba Qwen Team" }]
 
 dependencies = [
-  "transformers==4.57.3",
-  "accelerate==1.12.0",
-  "gradio",
+  "fastapi",
+  "uvicorn[standard]",
+  "websockets",
   "librosa",
+  "scipy",
+  "numpy",
+  "torch",
   "torchaudio",
   "soundfile",
+  "huggingface-hub",
+  "transformers",
+  "accelerate",
+  "einops",
   "sox",
   "onnxruntime",
-  "einops",
+  "datasets",
+  "torchcodec",
+  "python-dotenv",
+  "tqdm",
+  "gradio",
 ]
 
 [project.urls]
@@ -44,3 +54,17 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 qwen_tts = ["py.typed", "**/*.npz"]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
+
+[dependency-groups]
+dev = [
+  "pytest",
+  "pytest-asyncio",
+]

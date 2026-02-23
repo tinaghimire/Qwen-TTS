@@ -13,6 +13,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
+
+# Add Qwen3-TTS directory to Python path to find qwen_tts module
+script_dir = os.path.dirname(os.path.abspath(__file__))
+qwen3_tts_dir = os.path.dirname(script_dir)
+if qwen3_tts_dir not in sys.path:
+    sys.path.insert(0, qwen3_tts_dir)
+
 from typing import Any, List, Tuple, Union
 
 import librosa

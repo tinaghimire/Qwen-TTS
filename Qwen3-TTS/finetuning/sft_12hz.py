@@ -17,6 +17,13 @@ import argparse
 import json
 import os
 import shutil
+import sys
+
+# Add Qwen3-TTS directory to Python path to find qwen_tts module
+script_dir = os.path.dirname(os.path.abspath(__file__))
+qwen3_tts_dir = os.path.dirname(script_dir)
+if qwen3_tts_dir not in sys.path:
+    sys.path.insert(0, qwen3_tts_dir)
 
 import torch
 from accelerate import Accelerator
@@ -41,10 +48,11 @@ def train():
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     args = parser.parse_args()
 
-    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
+    accelerator = Accelerator(gradient_accumulation_steps=8, mixed_precision="bf16")
 
     MODEL_PATH = args.init_model_path
 
+    # Try to load model with different attention implementations
     try:
         qwen3tts = Qwen3TTSModel.from_pretrained(
             MODEL_PATH,
@@ -52,14 +60,25 @@ def train():
             attn_implementation="flash_attention_2",
         )
         print(f"✓ Model loaded with flash_attention_2")
-    except (ImportError, Exception) as e:
-        print(f"⚠ Flash attention not available, falling back to SDPA: {e}")
+    except ImportError as e:
+        print(f"⚠ Flash attention not available, falling back to SDPA")
+        print(f"   (You can install flash-attn for potentially faster training)")
+        qwen3tts = Qwen3TTSModel.from_pretrained(
+            MODEL_PATH,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+        print(f"✓ Model loaded with SDPA (Scaled Dot Product Attention)")
+    except Exception as e:
+        print(f"⚠ Error loading model with flash_attention_2: {e}")
+        print(f"   Trying SDPA fallback...")
         qwen3tts = Qwen3TTSModel.from_pretrained(
             MODEL_PATH,
             torch_dtype=torch.bfloat16,
             attn_implementation="sdpa",
         )
         print(f"✓ Model loaded with SDPA")
+    
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
     train_data = open(args.train_jsonl).readlines()
@@ -135,12 +154,10 @@ def train():
 
         if accelerator.is_main_process:
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
-            shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
 
-            input_config_file = os.path.join(MODEL_PATH, "config.json")
-            output_config_file = os.path.join(output_dir, "config.json")
-            with open(input_config_file, 'r', encoding='utf-8') as f:
-                config_dict = json.load(f)
+            # Use the config object we loaded earlier instead of reading from MODEL_PATH
+            config_dict = config.to_dict()
             config_dict["tts_model_type"] = "custom_voice"
             talker_config = config_dict.get("talker_config", {})
             talker_config["spk_id"] = {
@@ -151,8 +168,13 @@ def train():
             }
             config_dict["talker_config"] = talker_config
 
+            output_config_file = os.path.join(output_dir, "config.json")
             with open(output_config_file, 'w', encoding='utf-8') as f:
                 json.dump(config_dict, f, indent=2, ensure_ascii=False)
+
+            # Save processor config from the loaded model
+            if qwen3tts.processor is not None:
+                qwen3tts.processor.save_pretrained(output_dir)
 
             unwrapped_model = accelerator.unwrap_model(model)
             state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
@@ -166,6 +188,8 @@ def train():
             state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
             save_path = os.path.join(output_dir, "model.safetensors")
             save_file(state_dict, save_path)
+            
+            accelerator.print(f"✓ Checkpoint saved to {output_dir}")
 
 if __name__ == "__main__":
     train()

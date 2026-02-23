@@ -34,6 +34,7 @@ import os
 import shutil
 import subprocess
 import sys
+import datetime
 from dataclasses import dataclass
 from typing import Optional
 
@@ -51,7 +52,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Qwen3-TTS"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Qwen3-TTS", "finetuning"))
 
-from dataset_tool import HausaTTSDataset
+from dataset import TTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 
@@ -114,6 +115,10 @@ class TrainingArguments:
     skip_prepare: bool = os.getenv("SKIP_PREPARE", "false").lower() in ("true", "1", "yes")
     prepare_only: bool = os.getenv("PREPARE_ONLY", "false").lower() in ("true", "1", "yes")
     device: str = os.getenv("DEVICE", "cuda")
+    per_device_train_batch_size: int = int(os.getenv("PER_DEVICE_TRAIN_BATCH_SIZE", 4))
+
+
+
 
 
 class AdvancedTrainer:
@@ -135,6 +140,23 @@ class AdvancedTrainer:
                 init_kwargs={"wandb": {"name": args.wandb_run_name}}
             )
         
+        # Setup training log file
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = os.path.join(args.output_dir, f"training_log_{timestamp}.txt")
+        os.makedirs(args.output_dir, exist_ok=True)
+        
+        # Log training configuration
+        self.log("="*60)
+        self.log("Training Configuration:")
+        self.log(f"  Init Model Path: {args.init_model_path}")
+        self.log(f"  Output Path: {args.output_dir}")
+        self.log(f"  Batch Size: {args.batch_size}")
+        self.log(f"  Learning Rate: {args.learning_rate}")
+        self.log(f"  Epochs: {args.num_epochs}")
+        self.log(f"  Gradient Accumulation: {args.gradient_accumulation_steps}")
+        self.log(f"  Mixed Precision: {args.mixed_precision}")
+        self.log("="*60)
+        
         # Set reference audio path
         if args.ref_audio_path is None:
             args.ref_audio_path = os.path.join(
@@ -144,6 +166,7 @@ class AdvancedTrainer:
         
         # Load model and config
         print(f"Loading model from {args.init_model_path}...")
+        self.log(f"Loading model from {args.init_model_path}...")
         try:
             self.qwen3tts = Qwen3TTSModel.from_pretrained(
                 args.init_model_path,
@@ -152,8 +175,10 @@ class AdvancedTrainer:
                 attn_implementation="flash_attention_2",
             )
             print("✓ Model loaded with flash_attention_2")
+            self.log("✓ Model loaded with flash_attention_2")
         except (ImportError, Exception) as e:
             print(f"⚠ Flash attention not available, falling back to SDPA: {e}")
+            self.log(f"⚠ Flash attention not available, falling back to SDPA: {e}")
             self.qwen3tts = Qwen3TTSModel.from_pretrained(
                 args.init_model_path,
                 device_map="cuda",
@@ -165,20 +190,32 @@ class AdvancedTrainer:
         
         # Create datasets
         print("Creating datasets...")
-        self.train_dataset = HausaTTSDataset(args.train_jsonl)
+        self.log("Creating datasets...")
+        
+        # Load raw data from JSONL
+        with open(args.train_jsonl) as f:
+            train_data = [json.loads(line) for line in f]
+        
+        # Use TTSDataset which processes the data properly
+        self.train_dataset = TTSDataset(train_data, self.qwen3tts.processor, self.config)
+        self.log(f"✓ Training dataset loaded with {len(self.train_dataset)} samples")
         
         if args.validation_jsonl and os.path.exists(args.validation_jsonl):
-            self.eval_dataset = HausaTTSDataset(args.validation_jsonl)
+            with open(args.validation_jsonl) as f:
+                eval_data = [json.loads(line) for line in f]
+            self.eval_dataset = TTSDataset(eval_data, self.qwen3tts.processor, self.config)
+            self.log(f"✓ Validation dataset loaded with {len(self.eval_dataset)} samples")
         else:
             self.eval_dataset = None
             print("⚠ No validation dataset provided")
+            self.log("⚠ No validation dataset provided")
         
         # Create dataloaders
         self.train_dataloader = DataLoader(
             self.train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            collate_fn=self.collate_fn
+            collate_fn=self.train_dataset.collate_fn
         )
         
         if self.eval_dataset:
@@ -186,7 +223,7 @@ class AdvancedTrainer:
                 self.eval_dataset,
                 batch_size=args.batch_size,
                 shuffle=False,
-                collate_fn=self.collate_fn
+                collate_fn=self.eval_dataset.collate_fn
             )
         else:
             self.eval_dataloader = None
@@ -220,6 +257,7 @@ class AdvancedTrainer:
         self.global_step = 0
         self.best_eval_loss = float('inf')
         self.target_speaker_embedding = None
+        self.epoch_target_speaker_embedding = None  # Track embedding per epoch
         
         # Create output directory
         os.makedirs(args.output_dir, exist_ok=True)
@@ -236,7 +274,66 @@ class AdvancedTrainer:
     
     def compute_loss(self, batch):
         """Compute loss for a batch."""
-        loss = torch.tensor(0.0, requires_grad=True, device=self.model.device)
+        input_ids = batch['input_ids']
+        codec_ids = batch['codec_ids']
+        ref_mels = batch['ref_mels']
+        text_embedding_mask = batch['text_embedding_mask']
+        codec_embedding_mask = batch['codec_embedding_mask']
+        attention_mask = batch['attention_mask']
+        codec_0_labels = batch['codec_0_labels']
+        codec_mask = batch['codec_mask']
+        
+        # Get speaker embedding
+        speaker_embedding = self.model.speaker_encoder(
+            ref_mels.to(self.model.device).to(self.model.dtype)
+        ).detach()
+        
+        if self.target_speaker_embedding is None:
+            self.target_speaker_embedding = speaker_embedding
+        
+        # Process input embeddings
+        input_text_ids = input_ids[:, :, 0]
+        input_codec_ids = input_ids[:, :, 1]
+        
+        input_text_embedding = self.model.talker.model.text_embedding(
+            input_text_ids
+        ) * text_embedding_mask
+        input_codec_embedding = self.model.talker.model.codec_embedding(
+            input_codec_ids
+        ) * codec_embedding_mask
+        input_codec_embedding[:, 6, :] = speaker_embedding
+        
+        input_embeddings = input_text_embedding + input_codec_embedding
+        
+        # Add codec embeddings for all 16 code streams
+        for i in range(1, 16):
+            codec_i_embedding = self.model.talker.code_predictor.get_input_embeddings()[i - 1](
+                codec_ids[:, :, i]
+            )
+            codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
+            input_embeddings = input_embeddings + codec_i_embedding
+        
+        # Forward pass through talker
+        outputs = self.model.talker(
+            inputs_embeds=input_embeddings[:, :-1, :],
+            attention_mask=attention_mask[:, :-1],
+            labels=codec_0_labels[:, 1:],
+            output_hidden_states=True
+        )
+        
+        # Get hidden states for sub-talker
+        hidden_states = outputs.hidden_states[0][-1]
+        talker_hidden_states = hidden_states[codec_mask[:, 1:]]
+        talker_codec_ids = codec_ids[codec_mask]
+        
+        # Sub-talker loss
+        sub_talker_logits, sub_talker_loss = self.model.talker.forward_sub_talker_finetune(
+            talker_codec_ids, talker_hidden_states
+        )
+        
+        # Total loss
+        loss = outputs.loss + 0.3 * sub_talker_loss
+        
         return loss
     
     def train_epoch(self, epoch: int):
@@ -273,6 +370,9 @@ class AdvancedTrainer:
                 
                 # Logging
                 if self.global_step % self.args.logging_steps == 0:
+                    log_msg = f"Epoch {epoch} | Step {self.global_step} | Loss: {loss.item():.4f} | Avg Loss: {avg_loss:.4f} | LR: {self.scheduler.get_last_lr()[0]:.6f}"
+                    self.log(log_msg)
+                    
                     if self.args.use_wandb:
                         self.accelerator.log({
                             "train/loss": loss.item(),
@@ -285,12 +385,14 @@ class AdvancedTrainer:
                 # Evaluation
                 if self.global_step % self.args.eval_steps == 0 and self.eval_dataloader:
                     eval_loss = self.evaluate()
+                    self.log(f"Epoch {epoch} | Step {self.global_step} | Eval Loss: {eval_loss:.4f}")
                     if self.args.use_wandb:
                         self.accelerator.log({"eval/loss": eval_loss}, step=self.global_step)
                     
                     # Save best model
                     if eval_loss < self.best_eval_loss:
                         self.best_eval_loss = eval_loss
+                        self.save_checkpoint(os.path.join(self.args.output_dir, "best"))
                         self.save_checkpoint(os.path.join(self.args.output_dir, "best"))
                         if self.args.upload_to_hub:
                             self.upload_to_hub(os.path.join(self.args.output_dir, "best"), self.args.hub_model_id_best)
@@ -299,6 +401,7 @@ class AdvancedTrainer:
                 if self.global_step % self.args.save_steps == 0:
                     checkpoint_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.global_step}")
                     self.save_checkpoint(checkpoint_dir)
+                    self.log(f"Saved checkpoint at step {self.global_step}")
     
     @torch.no_grad()
     def evaluate(self):
@@ -331,23 +434,24 @@ class AdvancedTrainer:
         if self.accelerator.is_main_process:
             print(f"Saving checkpoint to {output_dir}...")
             
-            # Copy model files
-            shutil.copytree(self.args.init_model_path, output_dir, dirs_exist_ok=True)
+            # Create output directory
+            os.makedirs(output_dir, exist_ok=True)
             
-            # Update config
-            input_config_file = os.path.join(self.args.init_model_path, "config.json")
-            output_config_file = os.path.join(output_dir, "config.json")
-            with open(input_config_file, 'r', encoding='utf-8') as f:
-                config_dict = json.load(f)
-            
+            # Use config that was loaded earlier instead of reading from init_model_path
+            config_dict = self.config.to_dict()
             config_dict["tts_model_type"] = "custom_voice"
             talker_config = config_dict.get("talker_config", {})
             talker_config["spk_id"] = {self.args.speaker_name: 3000}
             talker_config["spk_is_dialect"] = {self.args.speaker_name: False}
             config_dict["talker_config"] = talker_config
             
+            output_config_file = os.path.join(output_dir, "config.json")
             with open(output_config_file, 'w', encoding='utf-8') as f:
                 json.dump(config_dict, f, indent=2, ensure_ascii=False)
+            
+            # Save processor if available
+            if self.qwen3tts.processor is not None:
+                self.qwen3tts.processor.save_pretrained(output_dir)
             
             # Save model weights
             unwrapped_model = self.accelerator.unwrap_model(self.model)
@@ -399,14 +503,15 @@ class AdvancedTrainer:
                 "training_state.pt",
             ]
             
-            # Also upload tokenizer and processor files if they exist
-            for file in os.listdir(self.args.init_model_path):
-                if file.endswith(".json") or file.endswith(".txt") or file == "tokenizer_config.json":
-                    src = os.path.join(self.args.init_model_path, file)
-                    dst = os.path.join(checkpoint_dir, file)
-                    if not os.path.exists(dst):
-                        shutil.copy(src, dst)
-                    files_to_upload.append(file)
+            # Also upload tokenizer and processor files from checkpoint directory
+            if os.path.exists(checkpoint_dir):
+                checkpoint_files = os.listdir(checkpoint_dir)
+                for file in checkpoint_files:
+                    if (file.endswith(".json") or file.endswith(".txt") or 
+                        file == "tokenizer_config.json" or file.startswith("tokenizer_") or
+                        file.startswith("preprocessor_")):
+                        if file not in files_to_upload:
+                            files_to_upload.append(file)
             
             # Upload each file
             for file in files_to_upload:
@@ -423,21 +528,29 @@ class AdvancedTrainer:
         except Exception as e:
             print(f"Error uploading to hub: {e}")
     
+    def log(self, message: str):
+        """Log message to both console and file."""
+        print(message)
+        if self.accelerator.is_main_process:
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                f.write(f"[{timestamp}] {message}\n")
+    
     def train(self):
         """Main training loop."""
-        print("Starting training...")
+        self.log("Starting training...")
         
         for epoch in range(self.args.num_epochs):
-            print(f"\n{'='*50}")
-            print(f"Epoch {epoch + 1}/{self.args.num_epochs}")
-            print(f"{'='*50}")
+            self.log(f"\n{'='*50}")
+            self.log(f"Epoch {epoch + 1}/{self.args.num_epochs}")
+            self.log(f"{'='*50}")
             
             self.train_epoch(epoch)
             
             # Evaluate at end of epoch
             if self.eval_dataloader:
                 eval_loss = self.evaluate()
-                print(f"Epoch {epoch + 1} - Eval Loss: {eval_loss:.4f}")
+                self.log(f"Epoch {epoch + 1} - Eval Loss: {eval_loss:.4f}")
                 
                 if self.args.use_wandb:
                     self.accelerator.log({
@@ -449,23 +562,45 @@ class AdvancedTrainer:
                 if eval_loss < self.best_eval_loss:
                     self.best_eval_loss = eval_loss
                     self.save_checkpoint(os.path.join(self.args.output_dir, "best"))
-                    if self.args.upload_to_hub:
-                        self.upload_to_hub(os.path.join(self.args.output_dir, "best"), self.args.hub_model_id_best)
+                    self.log(f"Saved best model at epoch {epoch + 1} with eval loss: {eval_loss:.4f}")
             
             # Save epoch checkpoint
             epoch_dir = os.path.join(self.args.output_dir, f"epoch-{epoch + 1}")
             self.save_checkpoint(epoch_dir)
+            self.log(f"Saved checkpoint for epoch {epoch + 1}")
         
         # Save final model
-        print("\nTraining completed!")
+        self.log("\nTraining completed!")
         final_dir = os.path.join(self.args.output_dir, "last")
         self.save_checkpoint(final_dir)
+        self.log(f"Saved final model to {final_dir}")
         
         if self.args.upload_to_hub:
             self.upload_to_hub(final_dir, self.args.hub_model_id_last)
         
+        # Save training summary
+        self.save_training_summary()
+        
         if self.args.use_wandb:
             self.accelerator.end_training()
+    
+    def save_training_summary(self):
+        """Save a summary of the training run."""
+        summary_path = os.path.join(self.args.output_dir, "training_summary.txt")
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            f.write("="*60 + "\n")
+            f.write("Training Summary\n")
+            f.write("="*60 + "\n")
+            f.write(f"Total Epochs: {self.args.num_epochs}\n")
+            f.write(f"Total Steps: {self.global_step}\n")
+            f.write(f"Batch Size: {self.args.batch_size}\n")
+            f.write(f"Learning Rate: {self.args.learning_rate}\n")
+            f.write(f"Best Eval Loss: {self.best_eval_loss}\n")
+            f.write(f"Output Directory: {self.args.output_dir}\n")
+            f.write(f"Checkpoints Saved: {self.args.num_epochs}\n")
+            f.write("="*60 + "\n")
+        
+        self.log(f"Training summary saved to {summary_path}")
 
 
 def prepare_data(args):
