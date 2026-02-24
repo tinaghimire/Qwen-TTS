@@ -171,8 +171,7 @@ def main():
             print("⚠ CUDA is not available (will use CPU)")
         print()
         print("You can now run:")
-        print("  python train_using_sft.py          # Simple training")
-        print("  python train_wandb_validation.py   # Advanced training")
+        print("  python train.py                    # Unified training script")
         return 0
     else:
         print("✗ Setup incomplete!")

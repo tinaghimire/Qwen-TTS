@@ -7,7 +7,7 @@ name = "qwen-tts"
 version = "0.1.1"
 description = "Qwen3-TTS python package"
 readme = "README.md"
-requires-python = ">=3.9,<3.13"
+requires-python = ">=3.10,<3.13"
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
@@ -19,26 +19,26 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Alibaba Qwen Team" }]
 
 dependencies = [
-  "fastapi",
-  "uvicorn[standard]",
-  "websockets",
-  "librosa",
-  "scipy",
-  "numpy",
-  "torch",
-  "torchaudio",
-  "soundfile",
-  "huggingface-hub",
-  "transformers",
-  "accelerate",
-  "einops",
-  "sox",
-  "onnxruntime",
-  "datasets",
-  "torchcodec",
-  "python-dotenv",
-  "tqdm",
-  "gradio",
+  "fastapi>=0.104.0",
+  "uvicorn[standard]>=0.24.0",
+  "websockets>=12.0",
+  "librosa>=0.10.0",
+  "scipy>=1.11.0",
+  "numpy>=1.24.0",
+  "torch>=2.5.0",
+  "torchaudio>=2.5.0",
+  "soundfile>=0.12.0",
+  "huggingface-hub>=0.19.0",
+  "transformers==4.57.3",
+  "accelerate==1.12.0",
+  "einops>=0.6.0",
+  "sox>=1.4.1",
+  "onnxruntime>=1.16.0",
+  "datasets>=2.14.0",
+  "torchcodec>=0.10.0",
+  "python-dotenv>=1.0.0",
+  "tqdm>=4.66.0",
+  "wandb>=0.25.0",
 ]
 
 [project.urls]

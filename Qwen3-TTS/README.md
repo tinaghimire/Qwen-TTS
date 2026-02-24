@@ -10,12 +10,20 @@ Comprehensive training pipeline for Qwen3-TTS voice cloning with Hausa TTS fine-
 - [Environment Configuration](#environment-configuration)
 - [Project Structure](#project-structure)
 - [Dataset Tool](#dataset-tool)
-- [Training Scripts](#training-scripts)
+- [Training](#training)
+  - [Unified Training Script (`train.py`)](#unified-training-script-trainpy)
+  - [Legacy Training Script (`finetuning/sft_12hz.py`)](#legacy-training-script-finetuningsft_12hzpy)
+  - [Training Scripts Comparison](#training-scripts-comparison)
+  - [Which Script Should You Use?](#which-script-should-you-use)
+  - [Example Workflows](#example-workflows)
+  - [Migration from `sft_12hz.py` to `train.py`](#migration-from-sft_12hzpy-to-trainpy)
+- [Layer Replacement and Addition](#layer-replacement-and-addition)
 - [Training Workflows](#training-workflows)
 - [Monitoring Training](#monitoring-training)
 - [Using the Trained Model](#using-the-trained-model)
 - [Architecture Overview](#architecture-overview)
 - [Troubleshooting](#troubleshooting)
+- [Training Analysis & Best Practices](#training-analysis--best-practices)
 
 ## Prerequisites
 
@@ -48,11 +56,8 @@ python test_setup.py
 # Create .env from template
 cp .env.training.example .env
 
-# Run simple training
-python train_using_sft.py
-
-# OR run advanced training with validation
-python train_wandb_validation.py
+# Run training
+python train.py
 ```
 
 ## Environment Configuration
@@ -94,7 +99,6 @@ All training settings are configured in `.env`. Here are the key variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `REF_AUDIO_PATH` | `voices/speaker/reference.wav` | Reference audio (5-10s) |
-| `REF_TEXT` | `""` | Reference transcription (for ICL) |
 | `SPEAKER_NAME` | `reference_speaker` | Speaker name |
 
 ### Dataset Limits
@@ -188,9 +192,8 @@ This script checks:
 
 ```
 Qwen3-TTS-finetuning/
-├── dataset_tool.py               # Unified dataset loading and preparation tool
-├── train_using_sft.py            # Simple training pipeline (uses sft_12hz.py)
-├── train_wandb_validation.py     # Advanced training pipeline (with validation, metrics, WandB)
+├── train.py                      # Unified training script
+├── data_processing.py            # Unified data processing module
 ├── test_setup.py                 # Setup verification script
 ├── .env.training.example         # Environment template
 ├── .env                          # Your configuration (copy from template)
@@ -202,91 +205,106 @@ Qwen3-TTS-finetuning/
 │   └── validation.jsonl
 └── Qwen3-TTS/                    # Core Qwen3-TTS library
     └── finetuning/
-        └── sft_12hz.py            # Base training script
+        ├── sft_12hz.py            # Base training script
+        ├── dataset.py             # Dataset class for training
+        └── layer_utils.py         # Layer replacement utilities
 ```
 
-## Dataset Tool
+## Data Processing
 
-The `dataset_tool.py` provides a unified interface to load data directly from HuggingFace and create PyTorch DataLoaders for training. **No intermediate JSONL files are needed!**
+The `data_processing.py` module provides two approaches for data handling:
 
-### Get Dataset Information
+### 1. JSONLDataPreparer - Prepare data from HuggingFace to JSONL
+
+Best for: Large datasets, repeated training runs, offline training
 
 ```bash
-# Get info about a dataset (without loading it)
-python dataset_tool.py --action info
+# Prepare all splits to JSONL
+python data_processing.py --mode prepare
 
-# Get info for a specific split
-python dataset_tool.py --action info --split validation
+# Prepare specific split
+python data_processing.py --mode prepare --split train
+
+# Limit samples
+python data_processing.py --mode prepare --max_samples 1000
 ```
 
-### Test DataLoaders
-
-```bash
-# Test training dataloader
-python dataset_tool.py --action train --batch_size 4
-
-# Test evaluation dataloader
-python dataset_tool.py --action eval --batch_size 4
-
-# Limit number of samples for testing
-python dataset_tool.py --action train --batch_size 2 --max_samples 10
-
-# Use multiple workers (for faster loading)
-python dataset_tool.py --action train --batch_size 4 --num_workers 4
-```
-
-### Use Dataset Tool in Python
+**Usage in Python:**
 
 ```python
-from dataset_tool import (
-    get_train_dataloader,
-    get_eval_dataloader,
-    get_dataloader,
-    QwenTTSDataset,
+from data_processing import JSONLDataPreparer
+
+# Create preparer
+preparer = JSONLDataPreparer(
+    dataset_name="vaghawan/hausa-tts-22k",
+    output_dir="./data",
+    tokenizer_path="Qwen/Qwen3-TTS-Tokenizer-12Hz",
+    device="cuda",
 )
 
-# Get training dataloader with defaults from .env
-train_loader = get_train_dataloader(batch_size=4, num_workers=4)
+# Prepare all splits
+output_files = preparer.prepare_all_splits()
 
-# Get evaluation dataloader
-val_loader = get_eval_dataloader(batch_size=4, num_workers=2)
+# Prepare specific split
+train_file = preparer.prepare_split("train", max_samples=1000)
+```
 
-# Create custom dataloader
-custom_loader = get_dataloader(
+### 2. HFDirectDataLoader - Load directly from HuggingFace
+
+Best for: Quick experiments, small datasets, online training
+
+```bash
+# Test direct loading
+python data_processing.py --mode direct --batch_size 4
+
+# Test with limited samples
+python data_processing.py --mode direct --max_samples 100
+```
+
+**Usage in Python:**
+
+```python
+from data_processing import HFDirectDataLoader, get_dataloader
+
+# Create dataset
+dataset = HFDirectDataLoader(
     dataset_name="vaghawan/hausa-tts-22k",
     split="train",
-    batch_size=8,
+    tokenizer_path="Qwen/Qwen3-TTS-Tokenizer-12Hz",
     max_samples=1000,
-    shuffle=True,
+)
+
+# Create dataloader
+dataloader = get_dataloader(
+    dataset_name="vaghawan/hausa-tts-22k",
+    split="train",
+    batch_size=4,
+    max_samples=1000,
 )
 
 # Iterate through batches
-for batch in train_loader:
-    # batch is a list of samples
+for batch in dataloader:
     for sample in batch:
         audio_array = sample["audio"]
         text = sample["text"]
         audio_codes = sample["audio_codes"]
         sr = sample["sr"]
         # ... process for training
-
-# Create PyTorch Dataset (no DataLoader)
-dataset = QwenTTSDataset(
-    dataset_name="vaghawan/hausa-tts-22k",
-    split="train",
-    max_samples=1000
-)
-print(f"Dataset size: {len(dataset)}")
-
-# Get single sample
-sample = dataset[0]
-print(f"Text: {sample['text']}")
-print(f"Audio codes shape: {len(sample['audio_codes'])}")
 ```
 
-### DataLoader Output Format
+### Get Dataset Information
 
-Each sample in the batch contains:
+```bash
+# Get info about a dataset
+python data_processing.py --mode info
+
+# Get info for specific split
+python data_processing.py --mode info --split validation
+```
+
+### Data Format
+
+Both approaches return the same data format:
 
 ```python
 {
@@ -300,75 +318,1002 @@ Each sample in the batch contains:
 }
 ```
 
-## Training Scripts
+### Choosing the Right Approach
 
-### 1. Simple Training (`train_using_sft.py`)
+| Approach | Best For | Pros | Cons |
+|----------|----------|------|------|
+| **JSONLDataPreparer** | Large datasets, repeated training | Fast loading, offline training, reproducible | Requires storage space, initial preparation time |
+| **HFDirectDataLoader** | Quick experiments, small datasets | No preparation needed, always up-to-date | Slower loading, requires internet |
 
-Direct training pipeline that loads data from HuggingFace on-the-fly. Perfect for quick experiments.
+## Training
+
+### Unified Training Script (`train.py`)
+
+The main training script that provides a complete training pipeline with all features integrated.
+
+**Main Workflow:**
+1. Load/prepare dataset
+2. Load models
+3. Login to WandB
+4. Fine-tune with parameters
 
 **Features:**
-- Loads data directly from HuggingFace (no intermediate JSONL files)
-- On-the-fly audio processing
-- Uses PyTorch DataLoader for efficient batch loading
-- Minimal configuration required
-- Fast setup with no data preparation step
+- **Multiple Data Modes**: JSONL, direct HuggingFace loading, or skip data preparation
+- **25Hz Tokenizer**: Uses Qwen3-TTS-Tokenizer-25Hz for high-quality audio
+- **Layer Replacement**: Replace and add layers for better fine-tuning
+- **Training Logging**: Logs training loss to `training_log.jsonl`
+- **Validation Logging**: Logs validation loss and metrics to `validation_log.jsonl`
+- **WandB Tracking**: Comprehensive metrics tracking
+- **Checkpointing**: Saves best and last models
+- **HuggingFace Upload**: Optional upload to HuggingFace Hub
 
 **Usage:**
 ```bash
 # Train with default settings
-python train_using_sft.py
+python train.py
 
-# Test DataLoader creation only
-echo "PREPARE_ONLY=true" >> .env
-python train_using_sft.py
+# Train with specific data mode
+DATA_MODE=jsonl python train.py
+DATA_MODE=direct python train.py
+DATA_MODE=none python train.py
+
+# Train with custom layer replacement
+REPLACE_LAST_N_LAYERS=4 ADD_NEW_LAYERS=8 python train.py
+```
+
+**Configuration:**
+
+Create a `.env` file with the following variables:
+
+```bash
+# Data Configuration
+DATA_MODE=jsonl  # Options: jsonl, direct, none
+DATASET_NAME=vaghawan/hausa-tts-22k
+TRAIN_JSONL=./data/train.jsonl
+VALIDATION_JSONL=./data/validation.jsonl
+
+# Model Configuration
+INIT_MODEL_PATH=Qwen/Qwen3-TTS-25Hz-1.7B-Base
+TOKENIZER_PATH=Qwen/Qwen3-TTS-Tokenizer-25Hz
+OUTPUT_DIR=./output
+SPEAKER_NAME=reference_speaker
+
+# Training Hyperparameters
+BATCH_SIZE=2
+LEARNING_RATE=2e-5
+NUM_EPOCHS=3
+GRADIENT_ACCUMULATION_STEPS=8
+WEIGHT_DECAY=0.01
+WARMUP_STEPS=200
+MAX_GRAD_NORM=1.0
+SUB_TALKER_LOSS_WEIGHT=0.3
+
+# Layer Replacement Configuration
+REPLACE_LAST_N_LAYERS=2
+ADD_NEW_LAYERS=4
+FREEZE_ORIGINAL_LAYERS=true
+
+# Logging and Checkpointing
+LOGGING_STEPS=10
+SAVE_STEPS=500
+EVAL_STEPS=500
+SAVE_TOTAL_LIMIT=3
+
+# WandB Configuration
+USE_WANDB=true
+WANDB_PROJECT=qwen3-tts-training
+WANDB_RUN_NAME=my_training_run
+WANDB_ENTITY=your_wandb_entity
+
+# HuggingFace Configuration
+HF_TOKEN=your_huggingface_token_here
+UPLOAD_TO_HF=false
+HF_BEST_MODEL_REPO=your-username/tts-best
+HF_LAST_MODEL_REPO=your-username/tts-last
+
+# Device and Precision
+DEVICE=cuda
+MIXED_PRECISION=bf16
+
+# Data Limits
+MAX_TRAIN_SAMPLES=
+MAX_EVAL_SAMPLES=
+
+# Reference Audio
+REF_AUDIO_PATH=
+```
+
+**Data Modes:**
+
+| Mode | Description | Best For |
+|------|-------------|----------|
+| `jsonl` | Uses pre-prepared JSONL files | Large datasets, repeated training |
+| `direct` | Loads directly from HuggingFace | Quick experiments, small datasets |
+| `none` | Skips data preparation | Testing, debugging |
+
+**Output Structure:**
+
+```
+output/
+├── best/                          # Best model (lowest validation loss)
+│   ├── model.safetensors
+│   ├── config.json
+│   ├── training_state.json
+│   └── processor files...
+├── last/                          # Last checkpoint
+│   ├── model.safetensors
+│   ├── config.json
+│   ├── training_state.json
+│   └── processor files...
+├── checkpoint-500/                # Intermediate checkpoints
+├── checkpoint-1000/
+├── training_log.jsonl             # Training loss logs
+└── validation_log.jsonl           # Validation loss and metrics logs
+```
+
+**Log Files:**
+
+**training_log.jsonl** - Training metrics:
+```json
+{
+  "step": 100,
+  "epoch": 0,
+  "loss": 2.3456,
+  "learning_rate": 1.8e-5,
+  "timestamp": "2026-02-24T10:30:00"
+}
+```
+
+**validation_log.jsonl** - Validation metrics:
+```json
+{
+  "step": 500,
+  "epoch": 0,
+  "loss": 2.1234,
+  "metrics": {
+    "speaker_embedding_similarity": 0.95
+  },
+  "timestamp": "2026-02-24T10:35:00"
+}
+```
+
+**Layer Replacement:**
+
+The script supports layer replacement to improve fine-tuning:
+
+1. **Original Layers**: The base model has a certain number of layers (e.g., 32 layers)
+2. **Replacement**: The last N layers are replaced with newly initialized layers
+3. **Addition**: M additional layers are added after the replacement
+4. **Freezing**: Original (non-replaced) layers can be frozen to prevent modification
+
+**Example Configuration:**
+
+If the original model has 32 layers:
+- `REPLACE_LAST_N_LAYERS=2`: Replace layers 31-32
+- `ADD_NEW_LAYERS=4`: Add 4 new layers (33-36)
+- `FREEZE_ORIGINAL_LAYERS=true`: Freeze layers 1-30
+
+**Result**: 36 total layers (30 frozen + 6 trainable)
+
+**Benefits:**
+- **Prevents Catastrophic Forgetting**: Freezing original layers preserves pre-trained knowledge
+- **Adapts to New Data**: New layers learn speaker-specific characteristics
+- **Flexible Architecture**: Adjust the number of layers based on your needs
+
+**Benefits:**
+- **Prevents Catastrophic Forgetting**: Freezing original layers preserves pre-trained knowledge
+- **Adapts to New Data**: New layers learn speaker-specific characteristics
+- **Flexible Architecture**: Adjust the number of layers based on your needs
+
+**Data Requirements:**
+
+The script expects JSONL files in the `data/` directory:
+
+- `data/train.jsonl`: Training data (required)
+- `data/validation.jsonl`: Validation data (optional)
+
+Each line in the JSONL file should contain:
+```json
+{
+  "text": "Your text here",
+  "audio": "path/to/audio.wav"
+}
 ```
 
 **How it works:**
-1. Calls `dataset_tool.py` to prepare training data
-2. Calls `Qwen3-TTS/finetuning/sft_12hz.py` with parameters from `.env`
-3. Saves model checkpoints to `OUTPUT_MODEL_PATH`
+1. Checks for local JSONL files in `data/` directory
+2. Calls `finetuning/sft_12hz.py` with layer replacement parameters
+3. Trains model with frozen original layers and trainable new layers
+4. Saves model checkpoints to `OUTPUT_MODEL_PATH`
+5. (Optional) Uploads models to HuggingFace Hub
 
-### 2. Advanced Training (`train_wandb_validation.py`)
+**Output:**
 
-Comprehensive training pipeline with validation, metrics, WandB logging, and model checkpointing.
+```
+output/
+├── checkpoint-epoch-0/
+│   ├── config.json
+│   ├── generation_config.json
+│   ├── model.safetensors
+│   ├── tokenizer_config.json
+│   ├── vocab.json
+│   ├── merges.txt
+│   ├── preprocessor_config.json
+│   ├── speech_tokenizer/
+│   ├── speaker_encoder/
+│   └── README.md
+├── checkpoint-epoch-1/
+└── checkpoint-epoch-2/
+```
+
+**Best Practices:**
+1. **Start Small**: Begin with `REPLACE_LAST_N_LAYERS=2` and `ADD_NEW_LAYERS=4`
+2. **Monitor Training**: Check loss curves to ensure convergence
+3. **Validate**: Use validation data to prevent overfitting
+4. **Save Checkpoints**: Keep multiple checkpoints for comparison
+5. **Test Loading**: Verify checkpoints can be loaded after training
+
+### Legacy Training Script (`finetuning/sft_12hz.py`)
+
+A simpler training script for quick experiments and debugging. This script uses command-line arguments instead of environment variables.
 
 **Features:**
-- Validation during training
-- WandB logging for detailed metrics
-- Checkpoint saving with optimizer and scheduler states
-- Best model tracking based on validation loss
-- Model upload to Hugging Face Hub
-- Mixed precision training support (BF16)
-- Gradient accumulation for larger effective batch sizes
+- **Simple Configuration**: Command-line arguments for all parameters
+- **12Hz Model**: Uses Qwen3-TTS-12Hz-1.7B-Base by default
+- **Layer Replacement**: Supports layer replacement and addition
+- **Basic Training**: Simple training loop without validation
+- **Per-Episode Checkpoints**: Saves checkpoints after each epoch
+- **No Logging**: Console output only, no log files
 
 **Usage:**
 ```bash
-# Train with default settings (includes WandB)
-python train_wandb_validation.py
+# Basic training with defaults
+python finetuning/sft_12hz.py \
+    --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --train_jsonl data/train.jsonl \
+    --output_model_path output \
+    --batch_size 2 \
+    --lr 2e-5 \
+    --num_epochs 3 \
+    --speaker_name my_speaker
 
-# Skip data preparation if already done
-echo "SKIP_PREPARE=true" >> .env
-python train_wandb_validation.py
+# Training with layer replacement
+python finetuning/sft_12hz.py \
+    --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --train_jsonl data/train.jsonl \
+    --output_model_path output \
+    --batch_size 2 \
+    --lr 2e-5 \
+    --num_epochs 3 \
+    --speaker_name my_speaker \
+    --replace_last_n_layers 3 \
+    --add_new_layers 5 \
+    --freeze_original_layers True
 
-# Disable WandB
-echo "USE_WANDB=false" >> .env
-python train_wandb_validation.py
-
-# Enable model upload
-echo "UPLOAD_TO_HUB=true" >> .env
-echo "HF_TOKEN=hf_your_token_here" >> .env
-python train_wandb_validation.py
+# Training with frozen speaker encoder
+python finetuning/sft_12hz.py \
+    --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --train_jsonl data/train.jsonl \
+    --output_model_path output \
+    --batch_size 2 \
+    --lr 2e-5 \
+    --num_epochs 3 \
+    --speaker_name my_speaker \
+    --freeze_speaker_encoder True
 ```
 
-**How it works:**
-1. (Optional) Calls `dataset_tool.py` to prepare training and validation data
-2. Initializes WandB tracker (if enabled)
-3. Loads model and datasets
-4. Sets up optimizer, scheduler, and accelerator
-5. Trains model with validation at regular intervals
-6. Saves best model (lowest validation loss) and last checkpoint
-7. (Optional) Uploads models to Hugging Face Hub
-8. Ends WandB tracking
+**Command-Line Arguments:**
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--init_model_path` | str | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Base model path |
+| `--output_model_path` | str | `output` | Output directory |
+| `--train_jsonl` | str | (required) | Path to training JSONL file |
+| `--batch_size` | int | `2` | Batch size |
+| `--lr` | float | `2e-5` | Learning rate |
+| `--num_epochs` | int | `3` | Number of epochs |
+| `--speaker_name` | str | `speaker_test` | Speaker name |
+| `--replace_last_n_layers` | int | `2` | Number of last layers to replace |
+| `--add_new_layers` | int | `4` | Number of additional layers to add |
+| `--freeze_original_layers` | bool | `True` | Whether to freeze original layers |
+| `--freeze_speaker_encoder` | bool | `False` | Whether to freeze speaker encoder |
+
+**Output Structure:**
+```
+output/
+├── checkpoint-epoch-0/
+│   ├── config.json
+│   ├── generation_config.json
+│   ├── model.safetensors
+│   ├── tokenizer_config.json
+│   ├── vocab.json
+│   ├── merges.txt
+│   ├── preprocessor_config.json
+│   ├── speech_tokenizer/
+│   ├── speaker_encoder/
+│   └── README.md
+├── checkpoint-epoch-1/
+└── checkpoint-epoch-2/
+```
+
+**When to Use:**
+- Quick debugging and testing
+- Simple training without validation
+- Experiments with 12Hz model specifically
+- Learning the training pipeline
+
+### Training Scripts Comparison
+
+| Feature | `train.py` | `finetuning/sft_12hz.py` |
+|---------|-----------|---------------------------|
+| **Configuration** | `.env` file | Command-line arguments |
+| **Data Modes** | 3 (jsonl, direct, none) | JSONL only |
+| **Validation** | ✅ Yes | ❌ No |
+| **Logging** | ✅ JSONL + WandB | ❌ Console only |
+| **Checkpointing** | Best + Last + Periodic | Per epoch only |
+| **Learning Rate Scheduler** | Cosine with warmup | None (default AdamW) |
+| **Gradient Accumulation** | Configurable | Fixed at 8 |
+| **Mixed Precision** | Configurable (bf16/fp16/no) | Fixed at bf16 |
+| **WandB Tracking** | ✅ Yes | ❌ No |
+| **HuggingFace Upload** | ✅ Yes | ❌ No |
+| **Training Metrics** | Loss, LR, Perplexity, Speaker Consistency | Loss only |
+| **Default Model** | 12Hz or 25Hz (configurable) | 12Hz only |
+| **Speaker Encoder Freeze** | Configurable | Configurable |
+| **Layer Replacement** | ✅ Yes | ✅ Yes |
+| **Recommended For** | Production training | Quick experiments |
+
+### Which Script Should You Use?
+
+#### Use `train.py` for:
+- ✅ **Production training** - Complete monitoring and evaluation
+- ✅ **Large datasets** - Efficient data loading with multiple modes
+- ✅ **Model selection** - Automatic best model saving based on validation
+- ✅ **Experiment tracking** - WandB integration for metrics visualization
+- ✅ **Model sharing** - Easy upload to HuggingFace Hub
+- ✅ **Reproducible runs** - Configuration saved in `.env` file
+- ✅ **25Hz models** - Support for higher quality audio generation
+
+#### Use `finetuning/sft_12hz.py` for:
+- ✅ **Quick debugging** - Simple setup, fast iteration
+- ✅ **Learning the pipeline** - Easier to understand the code
+- ✅ **Small experiments** - No validation overhead
+- ✅ **12Hz models** - Specifically designed for 12Hz models
+- ✅ **Testing layer replacement** - Quick verification of layer modifications
+
+### Example Workflows
+
+#### Workflow 1: Production Training with `train.py`
+
+```bash
+# Step 1: Create .env configuration
+cat > .env << EOF
+DATA_MODE=jsonl
+DATASET_NAME=vaghawan/hausa-tts-22k
+TRAIN_JSONL=./data/train.jsonl
+VALIDATION_JSONL=./data/validation.jsonl
+INIT_MODEL_PATH=Qwen/Qwen3-TTS-12Hz-1.7B-Base
+TOKENIZER_PATH=Qwen/Qwen3-TTS-Tokenizer-12Hz
+OUTPUT_DIR=./output
+SPEAKER_NAME=hausa_speaker
+BATCH_SIZE=1
+LEARNING_RATE=3e-5
+NUM_EPOCHS=30
+GRADIENT_ACCUMULATION_STEPS=16
+USE_WANDB=true
+WANDB_PROJECT=qwen3-tts-hausa
+EOF
+
+# Step 2: Run training
+python train.py
+
+# Step 3: Monitor training
+tail -f output/training_log.jsonl
+tail -f output/validation_log.jsonl
+
+# Step 4: Use best model
+python -c "
+from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+model = Qwen3TTSModel.from_pretrained('./output/best')
+"
+```
+
+#### Workflow 2: Quick Experiment with `sft_12hz.py`
+
+```bash
+# Step 1: Prepare data (if needed)
+python data_processing.py --mode prepare --max_samples 100
+
+# Step 2: Run quick training
+python finetuning/sft_12hz.py \
+    --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --train_jsonl data/train.jsonl \
+    --output_model_path output_quick \
+    --batch_size 2 \
+    --lr 2e-5 \
+    --num_epochs 1 \
+    --speaker_name test_speaker
+
+# Step 3: Test the model
+python -c "
+from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+model = Qwen3TTSModel.from_pretrained('./output_quick/checkpoint-epoch-0')
+"
+```
+
+#### Workflow 3: Layer Replacement Experiment
+
+```bash
+# Using train.py
+REPLACE_LAST_N_LAYERS=4 ADD_NEW_LAYERS=8 python train.py
+
+# Using sft_12hz.py
+python finetuning/sft_12hz.py \
+    --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --train_jsonl data/train.jsonl \
+    --output_model_path output_layers \
+    --batch_size 2 \
+    --lr 2e-5 \
+    --num_epochs 3 \
+    --speaker_name test_speaker \
+    --replace_last_n_layers 4 \
+    --add_new_layers 8 \
+    --freeze_original_layers True
+```
+
+### Migration from `sft_12hz.py` to `train.py`
+
+If you're currently using `sft_12hz.py` and want to migrate to `train.py`:
+
+```bash
+# Old command (sft_12hz.py)
+python finetuning/sft_12hz.py \
+    --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --train_jsonl data/train.jsonl \
+    --output_model_path output \
+    --batch_size 2 \
+    --lr 2e-5 \
+    --num_epochs 3 \
+    --speaker_name my_speaker \
+    --replace_last_n_layers 2 \
+    --add_new_layers 4 \
+    --freeze_original_layers True
+
+# New equivalent (train.py with .env)
+cat > .env << EOF
+DATA_MODE=jsonl
+TRAIN_JSONL=./data/train.jsonl
+VALIDATION_JSONL=./data/validation.jsonl
+INIT_MODEL_PATH=Qwen/Qwen3-TTS-12Hz-1.7B-Base
+TOKENIZER_PATH=Qwen/Qwen3-TTS-Tokenizer-12Hz
+OUTPUT_DIR=./output
+SPEAKER_NAME=my_speaker
+BATCH_SIZE=2
+LEARNING_RATE=2e-5
+NUM_EPOCHS=3
+GRADIENT_ACCUMULATION_STEPS=8
+REPLACE_LAST_N_LAYERS=2
+ADD_NEW_LAYERS=4
+FREEZE_ORIGINAL_LAYERS=true
+EOF
+
+python train.py
+```
+
+**Key Differences to Note:**
+1. `train.py` uses `LEARNING_RATE` instead of `--lr`
+2. `train.py` requires `TOKENIZER_PATH` to be specified
+3. `train.py` automatically creates validation logs if `VALIDATION_JSONL` is provided
+4. `train.py` saves best model based on validation loss, not just last epoch
+
+## Layer Replacement and Addition
+
+The layer replacement feature allows you to replace the last N layers of the Qwen3TTSTalker model with newly initialized layers and add M additional layers for better fine-tuning.
+
+### Overview
+
+This feature enables:
+- Replace the last N layers with newly initialized layers
+- Add M additional layers after the replacement
+- Freeze the original layers to preserve pre-trained knowledge
+- Fine-tune only the new layers for better speaker adaptation
+
+### Architecture Change
+
+```
+Original Model (20 layers):
+├── Layers 1-18 (pre-trained)
+├── Layer 19 (pre-trained)
+└── Layer 20 (pre-trained)
+
+Modified Model (24 layers):
+├── Layers 1-18 (frozen, pre-trained)
+├── Layer 19 (newly initialized)
+├── Layer 20 (newly initialized)
+├── Layer 21 (newly initialized)
+├── Layer 22 (newly initialized)
+├── Layer 23 (newly initialized)
+└── Layer 24 (newly initialized)
+```
+
+### Usage
+
+#### Basic Usage (Default: Replace 2, Add 4)
+
+```bash
+python finetuning/sft_12hz.py \
+    --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --train_jsonl data/train.jsonl \
+    --output_model_path output \
+    --batch_size 2 \
+    --lr 2e-5 \
+    --num_epochs 3 \
+    --speaker_name my_speaker
+```
+
+This will:
+- Replace the last 2 layers (19-20) with newly initialized layers
+- Add 4 additional layers (21-24)
+- Freeze layers 1-18
+- Train only on layers 19-24
+
+#### Custom Configuration
+
+```bash
+python finetuning/sft_12hz.py \
+    --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --train_jsonl data/train.jsonl \
+    --output_model_path output \
+    --batch_size 2 \
+    --lr 2e-5 \
+    --num_epochs 3 \
+    --speaker_name my_speaker \
+    --replace_last_n_layers 3 \
+    --add_new_layers 5 \
+    --freeze_original_layers True
+```
+
+### Command-Line Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--replace_last_n_layers` | int | 2 | Number of last layers to replace |
+| `--add_new_layers` | int | 4 | Number of additional layers to add |
+| `--freeze_original_layers` | bool | True | Whether to freeze original layers |
+
+### Training Output
+
+When you run the training script, you'll see detailed output about the layer replacement:
+
+```
+============================================================
+Layer Replacement and Addition
+============================================================
+Original number of layers: 20
+Replacing last 2 layers
+Adding 4 new layers
+Total new layers: 24
+
+Keeping layers 1-18 (frozen: True)
+  - Layer 1: Frozen
+  - Layer 2: Frozen
+  ...
+  - Layer 18: Frozen
+  - Layer 19: Replacement (freshly initialized)
+  - Layer 20: Replacement (freshly initialized)
+  - Layer 21: Additional (freshly initialized)
+  - Layer 22: Additional (freshly initialized)
+  - Layer 23: Additional (freshly initialized)
+  - Layer 24: Additional (freshly initialized)
+
+============================================================
+Layer replacement complete!
+New total number of layers: 24
+Configuration updated: num_hidden_layers = 24
+============================================================
+
+============================================================
+Model Summary
+============================================================
+Total layers: 24
+Hidden size: 1024
+Intermediate size: 2048
+Attention heads: 16
+
+Parameter counts:
+  Trainable: 123,456,789 (15.23%)
+  Frozen: 687,654,321 (84.77%)
+  Total: 811,111,110
+
+Layer status:
+  Trainable layers: 6
+  Frozen layers: 18
+============================================================
+```
+
+### Checkpoint Saving
+
+During training, checkpoints are saved with the updated configuration:
+
+```
+Epoch 0 | Step 0 | Loss: 2.3456
+Saving checkpoint with 24 layers (actual: 24)
+Saving 24 layers in checkpoint
+✓ Saved generation_config.json
+✓ Saved processor and tokenizer files
+✓ Saved speech_tokenizer to output/checkpoint-epoch-0/speech_tokenizer
+✓ Saved speaker encoder config for speaker: my_speaker
+✓ Saved model.safetensors
+
+============================================================
+Checkpoint contents:
+============================================================
+  - config.json
+  - generation_config.json
+  - model.safetensors
+  - tokenizer_config.json
+  - vocab.json
+  - merges.txt
+  - preprocessor_config.json
+  - speech_tokenizer/config.json
+  - speech_tokenizer/model.safetensors
+  - speech_tokenizer/tokenizer_config.json
+  - speaker_encoder/speaker_config.json
+  - README.md
+============================================================
+Total files saved: 12
+============================================================
+
+✓ Checkpoint saved to output/checkpoint-epoch-0
+```
+
+The saved checkpoint includes:
+- All 24 layers (18 frozen + 6 trainable)
+- Updated configuration with `num_hidden_layers = 24`
+- Speaker embedding at index 3000
+- **Complete set of files for model loading**:
+  - `config.json` - Model configuration
+  - `generation_config.json` - Generation parameters
+  - `model.safetensors` - Model weights
+  - `tokenizer_config.json` - Text tokenizer config
+  - `vocab.json` - Vocabulary file
+  - `merges.txt` - BPE merges
+  - `preprocessor_config.json` - Preprocessor config
+  - `speech_tokenizer/` - Speech tokenizer (codec encoder/decoder)
+  - `speaker_encoder/speaker_config.json` - Speaker information
+  - `README.md` - Usage instructions
+
+### Benefits
+
+1. **Better Speaker Adaptation**: New layers can learn speaker-specific patterns without forgetting pre-trained knowledge
+2. **Faster Training**: Only training 6 layers instead of 20 reduces training time
+3. **Memory Efficient**: Fewer trainable parameters means lower memory usage
+4. **Flexible**: Easy to adjust the number of replaced/added layers via command-line arguments
+
+### Layer Initialization
+
+New layers are initialized using Xavier/Glorot uniform initialization:
+- Linear layers: `nn.init.xavier_uniform_`
+- Embedding layers: `nn.init.normal_(mean=0.0, std=0.02)`
+- Bias terms: Initialized to zeros
+
+This ensures the new layers start with reasonable weights and can be trained effectively.
+
+### Loading Fine-Tuned Models
+
+When loading a fine-tuned model with modified layers, ensure you use the correct configuration:
+
+```python
+from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+
+model = Qwen3TTSModel.from_pretrained(
+    "output/checkpoint-epoch-0",
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2"
+)
+```
+
+The model will automatically load with 24 layers as specified in the saved configuration.
+
+### Troubleshooting
+
+#### Issue: "Configuration layer count doesn't match actual layers"
+
+The training script automatically detects and fixes this issue. If you see this warning, the configuration will be corrected before saving.
+
+#### Issue: Out of Memory
+
+If you encounter OOM errors:
+- Reduce `--batch_size`
+- Reduce `--add_new_layers` to decrease trainable parameters
+- Use gradient accumulation (already set to 8 by default)
+
+#### Issue: Slow Training
+
+If training is too slow:
+- Reduce `--add_new_layers` to decrease trainable parameters
+- Increase `--batch_size` if memory allows
+- Use mixed precision training (already enabled with bf16)
+
+### Advanced Usage
+
+#### Programmatic Layer Replacement
+
+You can also use the layer replacement utility programmatically:
+
+```python
+from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+from finetuning.layer_utils import replace_and_add_layers, print_model_summary
+
+# Load model
+model = Qwen3TTSModel.from_pretrained(
+    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    torch_dtype=torch.bfloat16
+)
+
+# Replace and add layers
+model.model = replace_and_add_layers(
+    model.model,
+    replace_last_n=2,
+    add_new_layers=4,
+    freeze_original_layers=True,
+    verbose=True
+)
+
+# Print summary
+print_model_summary(model.model)
+```
+
+#### Custom Layer Initialization
+
+If you want to use a different initialization scheme, modify the `initialize_decoder_layer` function in `finetuning/layer_utils.py`:
+
+```python
+def initialize_decoder_layer(layer: Qwen3TTSTalkerDecoderLayer):
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            # Use Kaiming initialization instead of Xavier
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    layer.apply(_init_weights)
+```
+
+### Checkpoint Structure
+
+When training completes, checkpoints are saved with all necessary files for complete model loading.
+
+#### Complete Checkpoint Contents
+
+```
+checkpoint-epoch-N/
+├── config.json                          # Main model configuration
+├── generation_config.json               # Generation parameters (temperature, top_k, etc.)
+├── model.safetensors                    # Model weights (all layers except speaker_encoder)
+├── tokenizer_config.json                # Text tokenizer configuration
+├── vocab.json                           # Vocabulary for text tokenizer
+├── merges.txt                           # BPE merges for text tokenizer
+├── preprocessor_config.json             # Preprocessor configuration
+├── speech_tokenizer/                    # Speech tokenizer directory
+│   ├── config.json                      # Speech tokenizer config
+│   ├── model.safetensors                # Speech tokenizer weights
+│   └── tokenizer_config.json            # Speech tokenizer config
+├── speaker_encoder/                     # Speaker encoder directory
+│   └── speaker_config.json              # Speaker configuration (speaker name, embedding dim)
+└── README.md                            # Usage instructions
+```
+
+#### File Descriptions
+
+**Core Model Files:**
+
+| File | Description | Required |
+|------|-------------|----------|
+| `config.json` | Main model configuration including layer count, hidden size, attention heads, etc. | Yes |
+| `generation_config.json` | Default generation parameters (temperature, top_p, top_k, etc.) | Yes |
+| `model.safetensors` | All model weights except speaker_encoder (frozen during training) | Yes |
+
+**Text Tokenizer Files:**
+
+| File | Description | Required |
+|------|-------------|----------|
+| `tokenizer_config.json` | Configuration for the text tokenizer | Yes |
+| `vocab.json` | Vocabulary mapping for text tokens | Yes |
+| `merges.txt` | BPE merge rules for text tokenization | Yes |
+| `preprocessor_config.json` | Preprocessing configuration for text | Yes |
+
+**Speech Tokenizer Files:**
+
+| File | Description | Required |
+|------|-------------|----------|
+| `speech_tokenizer/config.json` | Speech tokenizer configuration | Yes |
+| `speech_tokenizer/model.safetensors` | Speech tokenizer weights (codec encoder/decoder) | Yes |
+| `speech_tokenizer/tokenizer_config.json` | Speech tokenizer config | Yes |
+
+**Speaker Information:**
+
+| File | Description | Required |
+|------|-------------|----------|
+| `speaker_encoder/speaker_config.json` | Speaker name and embedding dimension | Yes |
+
+**Documentation:**
+
+| File | Description | Required |
+|------|-------------|----------|
+| `README.md` | Usage instructions and model information | No |
+
+#### Why Each File is Needed
+
+**1. config.json**
+- Contains the complete model architecture configuration
+- Includes layer count (updated after layer replacement)
+- Specifies hidden size, attention heads, etc.
+- Required for reconstructing the model architecture
+
+**2. generation_config.json**
+- Stores default generation parameters
+- Ensures consistent generation behavior
+- Includes temperature, top_p, top_k, max_new_tokens, etc.
+
+**3. model.safetensors**
+- Contains all trainable model weights
+- Excludes speaker_encoder (frozen during training)
+- Includes the new speaker embedding at index 3000
+- Uses safetensors format for security and efficiency
+
+**4. Text Tokenizer Files (tokenizer_config.json, vocab.json, merges.txt)**
+- Required for encoding input text
+- Converts text to token IDs
+- Essential for the model to understand input
+
+**5. preprocessor_config.json**
+- Configuration for text preprocessing
+- Handles special tokens, padding, etc.
+
+**6. speech_tokenizer/ directory**
+- **CRITICAL**: Contains the codec encoder/decoder
+- Required for converting audio codes to waveform
+- Without this, you cannot generate audio output
+- Includes:
+  - `config.json`: Speech tokenizer configuration
+  - `model.safetensors`: Codec model weights
+  - `tokenizer_config.json`: Additional tokenizer config
+
+**7. speaker_encoder/speaker_config.json**
+- Stores speaker name and embedding dimension
+- Documents which speaker the model was fine-tuned for
+- Useful for reference and model management
+
+**8. README.md**
+- Provides usage instructions
+- Documents model information
+- Helpful for users loading the checkpoint
+
+#### Speaker Embedding Storage
+
+The new speaker embedding is stored in the model weights:
+
+```python
+# Location: model.safetensors
+# Key: talker.model.codec_embedding.weight[3000]
+# Shape: [embedding_dim] (typically 1024)
+```
+
+This embedding is extracted from the reference audio during training and inserted at index 3000 of the codec embedding layer.
+
+#### Loading a Checkpoint
+
+```python
+from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+
+# Load the complete checkpoint
+model = Qwen3TTSModel.from_pretrained(
+    "./output/checkpoint-epoch-0",
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2"
+)
+
+# The model will automatically load:
+# - Model architecture from config.json
+# - Model weights from model.safetensors
+# - Text tokenizer from tokenizer files
+# - Speech tokenizer from speech_tokenizer/ directory
+# - Generation parameters from generation_config.json
+```
+
+#### What's NOT Saved
+
+**Speaker Encoder Weights**
+
+The speaker encoder weights are **NOT** saved because:
+1. They are frozen during training
+2. They are shared across all speakers
+3. They can be loaded from the base model
+4. Saving them would duplicate large weights unnecessarily
+
+If you need the speaker encoder, load it from the base model:
+
+```python
+from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+
+# Load base model to get speaker encoder
+base_model = Qwen3TTSModel.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+speaker_encoder = base_model.model.speaker_encoder
+
+# Load fine-tuned model
+fine_tuned_model = Qwen3TTSModel.from_pretrained("./output/checkpoint-epoch-0")
+```
+
+#### Checkpoint Size
+
+Typical checkpoint sizes:
+
+| Component | Size |
+|-----------|------|
+| model.safetensors | ~3-4 GB |
+| speech_tokenizer/ | ~500 MB |
+| Config files | ~10 KB |
+| **Total** | **~3.5-4.5 GB** |
+
+#### Verification
+
+After saving, the training script will display:
+
+```
+============================================================
+Checkpoint contents:
+============================================================
+  - config.json
+  - generation_config.json
+  - model.safetensors
+  - tokenizer_config.json
+  - vocab.json
+  - merges.txt
+  - preprocessor_config.json
+  - speech_tokenizer/config.json
+  - speech_tokenizer/model.safetensors
+  - speech_tokenizer/tokenizer_config.json
+  - speaker_encoder/speaker_config.json
+  - README.md
+============================================================
+Total files saved: 12
+============================================================
+```
+
+#### Troubleshooting
+
+**Issue: Missing speech_tokenizer directory**
+
+**Solution**: Ensure the base model has a speech_tokenizer attribute. Check:
+
+```python
+print(hasattr(model, 'speech_tokenizer'))
+print(model.speech_tokenizer is not None)
+```
+
+**Issue: Cannot load checkpoint**
+
+**Solution**: Verify all required files are present:
+- config.json
+- model.safetensors
+- speech_tokenizer/ directory with all its files
+
+**Issue: Generation fails**
+
+**Solution**: Check that:
+1. speech_tokenizer/ directory exists and contains model.safetensors
+2. generation_config.json exists
+3. All tokenizer files are present
+
+#### Best Practices
+
+1. **Always save the complete checkpoint** - Don't skip any files
+2. **Verify checkpoint contents** - Check the file list after saving
+3. **Test loading** - Try loading the checkpoint immediately after saving
+4. **Document speaker information** - Keep track of which speaker each checkpoint is for
+5. **Use consistent naming** - Include speaker name and epoch in checkpoint directory name
 
 ## Training Workflows
 
@@ -384,25 +1329,21 @@ cp .env.training.example .env
 python test_setup.py
 
 # Step 3: Train with defaults
-python train_using_sft.py
+python train.py
 
-# Output: ./output/checkpoint-epoch-*/
+# Output: ./output/best/, ./output/last/
 ```
 
-### Workflow 2: Advanced Training - Production
+### Workflow 2: Training with JSONL Files
 
-Best for production models with proper validation and monitoring.
+Best for large datasets or repeated training runs.
 
 ```bash
-# Step 1: Create .env from template
-cp .env.training.example .env
-nano .env  # Edit configuration
+# Step 1: Prepare data to JSONL
+python data_processing.py --mode prepare
 
-# Step 2: Verify setup
-python test_setup.py
-
-# Step 3: Train
-python train_wandb_validation.py
+# Step 2: Train with JSONL mode
+DATA_MODE=jsonl python train.py
 
 # Output: ./output/best/, ./output/last/
 ```
@@ -413,10 +1354,10 @@ Best for debugging code and setup issues.
 
 ```bash
 # Step 1: Prepare small dataset
-python dataset_tool.py --max_samples 10
+python data_processing.py --mode prepare --max_samples 10
 
 # Step 2: Train for 1 epoch
-python train_using_sft.py --num_epochs 1
+NUM_EPOCHS=1 python train.py
 ```
 
 ### Workflow 4: Resume from Checkpoint
@@ -431,16 +1372,31 @@ python train_using_sft.py --num_epochs 1
 
 ### Console Output
 
-Both training scripts output progress to the console:
+The training script outputs progress to the console:
 
 ```
-Epoch 0 | Step 10 | Loss: 2.3456
-Epoch 0 | Step 20 | Loss: 2.1234
+Epoch 0 | Step 10 | Loss: 2.3456 | LR: 1.8e-5
+Epoch 0 | Step 20 | Loss: 2.1234 | LR: 1.7e-5
 ```
 
-### WandB Dashboard (Advanced Training)
+### Log Files
 
-For advanced training, WandB provides comprehensive monitoring:
+The training script creates two log files:
+
+**training_log.jsonl** - Training metrics:
+```json
+{"step": 100, "epoch": 0, "loss": 2.3456, "learning_rate": 1.8e-5, "timestamp": "2026-02-24T10:30:00"}
+{"step": 200, "epoch": 0, "loss": 2.1234, "learning_rate": 1.7e-5, "timestamp": "2026-02-24T10:35:00"}
+```
+
+**validation_log.jsonl** - Validation metrics:
+```json
+{"step": 500, "epoch": 0, "loss": 2.1234, "metrics": {"speaker_embedding_similarity": 0.95}, "timestamp": "2026-02-24T10:35:00"}
+```
+
+### WandB Dashboard
+
+When WandB is enabled, comprehensive monitoring is available:
 
 ```bash
 # 1. Login to WandB (if needed)
@@ -455,34 +1411,29 @@ wandb dashboard
 - Training loss over time
 - Validation loss
 - Learning rate schedule
-- Gradient norms
+- Speaker embedding similarity
 - Checkpoint information
 - Model comparison
 
 ### Output Structure
 
-#### Simple Training Output
-
-```
-output/
-├── checkpoint-epoch-0/
-│   ├── config.json
-│   ├── model.safetensors
-│   └── tokenizer files...
-├── checkpoint-epoch-1/
-├── checkpoint-epoch-2/
-```
-
-#### Advanced Training Output
-
 ```
 output/
 ├── best/                          # Best model (lowest validation loss)
-│   ├── config.json
 │   ├── model.safetensors
-│   └── training_state.pt         # Optimizer and scheduler states
-├── last/                          # Last checkpoint
 │   ├── config.json
+│   ├── training_state.json
+│   └── processor files...
+├── last/                          # Last checkpoint
+│   ├── model.safetensors
+│   ├── config.json
+│   ├── training_state.json
+│   └── processor files...
+├── checkpoint-500/                # Intermediate checkpoints
+├── checkpoint-1000/
+├── training_log.jsonl             # Training loss logs
+└── validation_log.jsonl           # Validation loss and metrics logs
+```
 │   ├── model.safetensors
 │   └── training_state.pt
 ├── checkpoint-500/                # Intermediate checkpoints
@@ -706,6 +1657,303 @@ python -c "from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel; model =
 # Check output directory exists
 ls -la ./output/best/
 ```
+
+## Training Analysis & Best Practices
+
+### Current Training Configuration
+
+#### Model Information
+
+| Parameter | Value |
+|-----------|-------|
+| **Model Name** | Qwen/Qwen3-TTS-12Hz-1.7B-Base |
+| **Model Size** | 1.7 Billion Parameters |
+| **Audio Codec** | 12Hz Audio Codec (16 codebooks) |
+| **Training Mode** | Custom Voice (Voice Cloning) |
+| **Attention Implementation** | SDPA (Scaled Dot Product Attention) |
+| **Mixed Precision** | BF16 |
+
+#### Training Hyperparameters
+
+| Parameter | Current Value | Recommended Range | Description |
+|-----------|---------------|-------------------|-------------|
+| **Batch Size** | 8 | 1-4 | Samples per batch |
+| **Learning Rate** | 2e-4 (0.0002) | 1e-5 to 1e-4 | Optimizer learning rate |
+| **Gradient Accumulation** | 4 (implicit) | 8-16 | Steps before weight update |
+| **Number of Epochs** | 3 | 10-50 | Training iterations |
+| **Weight Decay** | 0.01 | 0.001-0.1 | L2 regularization |
+| **Warmup Steps** | 100 | 100-500 | LR warm-up period |
+| **Max Gradient Norm** | 1.0 | 0.5-1.0 | Gradient clipping |
+| **Effective Batch Size** | 32 | 32-64 | batch_size × grad_accum |
+
+#### Dataset Information
+
+| Parameter | Value |
+|-----------|-------|
+| **Dataset Name** | vaghawan/hausa-tts-22k |
+| **Language** | Hausa |
+| **Training Samples** | 984 (full) / 100 (limited) |
+| **Validation Samples** | Not configured |
+| **Text Length** | Short to medium sentences |
+| **Audio Codec** | Pre-extracted (16 codebooks × 16 timesteps) |
+| **Reference Voice** | English Voice (cross-language cloning) |
+
+### Common Training Issues
+
+#### Issue: Loss Drops to 0.0000 Too Quickly
+
+**WARNING:** Loss dropping to 0.0000 immediately indicates:
+
+1. **Overfitting** - Model memorized small dataset
+2. **Loss Computation Issue** - Possibly NaN/Inf masked as 0
+3. **Insufficient Training Data** - Only 100 samples
+4. **High Learning Rate** - 2e-4 is too aggressive for 1.7B model
+5. **Cross-language Mismatch** - English reference for Hausa text
+
+**Root Causes:**
+
+1. **All samples have identical audio_codes**
+   - Every sample in your dataset has the EXACT SAME audio codes
+   - Model learns to predict the same codes regardless of text
+   - Loss becomes zero because target is always identical
+
+2. **Cross-language voice cloning problem**
+   - Reference voice: English
+   - Target text: Hausa
+   - Phonetic mismatch causes poor articulation
+
+3. **Insufficient data diversity**
+   - Only 100 samples
+   - Limited phonetic coverage
+   - Minimal prosodic variation
+
+### Recommended Training Configuration
+
+#### Best Practices Configuration
+
+```bash
+# .env file - Recommended Settings
+
+# Model Settings
+MODEL_PATH=Qwen/Qwen3-TTS-12Hz-1.7B-Base
+OUTPUT_DIR=./output_v2
+
+# Critical Hyperparameters
+BATCH_SIZE=1                    # Per GPU
+LR=3e-5                        # Conservative LR
+NUM_EPOCHS=30                  # Sufficient training
+GRADIENT_ACCUMULATION_STEPS=16 # Effective batch = 16
+EFFECTIVE_BATCH_SIZE=16        # 1 × 16
+
+# Regularization
+WEIGHT_DECAY=0.01              # Default
+MAX_GRAD_NORM=0.5              # Stricter clipping
+WARMUP_STEPS=500               # Gentle warmup
+
+# Dataset
+DATASET_NAME=vaghawan/hausa-tts-22k
+MAX_TRAIN_SAMPLES=5000         # More data
+MAX_EVAL_SAMPLES=500           # Validation
+TRAIN_JSONL=./data/train_v2.jsonl
+VALIDATION_JSONL=./data/val_v2.jsonl
+
+# Reference Audio (TARGET LANGUAGE!)
+REF_AUDIO_PATH=./voices/hausa_reference.wav
+REF_TEXT="Sanannun za ku iya tattaunawa da bayyana..."  # Hausa text
+
+# Logging
+LOGGING_STEPS=5                # Frequent logging
+EVAL_STEPS=100                 # Evaluate every 100 steps
+SAVE_STEPS=500                 # Save checkpoints
+```
+
+#### Alternative: Aggressive Training (More Computation)
+
+```bash
+# For best results with more resources:
+BATCH_SIZE=2
+LR=5e-5
+NUM_EPOCHS=50
+GRADIENT_ACCUMULATION_STEPS=8
+MAX_TRAIN_SAMPLES=10000
+```
+
+### Action Plan for Best Voice Cloning Results
+
+#### Phase 1: Immediate Fixes (Priority 1)
+
+**1.1 Fix Training Hyperparameters**
+
+```bash
+# Update .env file with these values
+BATCH_SIZE=1                    # Reduce for better gradient quality
+LR=5e-5                        # Lower learning rate (2.5x lower)
+NUM_EPOCHS=20                  # More epochs for better learning
+GRADIENT_ACCUMULATION_STEPS=16 # Increase effective batch size
+WARMUP_STEPS=300               # Longer warmup
+LOGGING_STEPS=5                # More frequent logging
+```
+
+**1.2 Increase Dataset Size**
+
+```bash
+# Remove sample limit
+MAX_TRAIN_SAMPLES=5000         # Use more samples
+MAX_EVAL_SAMPLES=500           # Add validation data
+```
+
+**1.3 Fix Audio Code Extraction**
+
+**CRITICAL:** Currently all samples have identical codes. Need to extract unique codes per audio file.
+
+Check `dataset_tool.py` line:
+
+```python
+# Look for this pattern - codes should vary per sample
+audio_codes = tokenizer.encode(audio_data)  # Should extract from actual audio
+```
+
+**1.4 Add Validation Set**
+
+```bash
+# Create proper validation split
+VALIDATION_JSONL=./data/validation.jsonl
+MAX_EVAL_SAMPLES=200
+```
+
+#### Phase 2: Audio & Data Quality (Priority 2)
+
+**2.1 Language-Specific Reference Audio**
+
+**CURRENT PROBLEM:** Using English reference for Hausa text
+
+**SOLUTION:** Choose reference audio from target language
+
+```bash
+# Options:
+# 1. Use Hausa speaker's audio (if available)
+REF_AUDIO_PATH=./voices/hausa_speaker.wav
+
+# 2. Use multi-lingual speaker
+REF_AUDIO_PATH=./voices/multilingual_speaker.wav
+```
+
+**Or use the target language data:**
+```python
+# Use one of the training samples as reference
+REF_AUDIO_PATH=/path/to/clear/hausa_sample.wav
+REF_TEXT="Sample text in Hausa with good articulation"
+```
+
+**2.2 Audio Quality Requirements**
+
+Your reference audio should:
+
+✅ **DO:**
+- Be 10-30 seconds long
+- Have clear pronunciation
+- Contain multiple phonemes
+- Have natural prosody
+- Be in the target language (Hausa)
+- Have consistent volume
+- Be recorded at 24kHz
+
+❌ **DON'T:**
+- Use background noise
+- Use clipped audio
+- Use very short (<5s) samples
+- Use cross-language for critical tasks
+- Use very long (>60s) samples
+
+### Expected Results Analysis
+
+#### Current Configuration (Estimated Quality)
+
+| Metric | Expected | Reality |
+|--------|----------|---------|
+| **MOS (Mean Opinion Score)** | 1.5-2.0/5.0 | ~1.0/5.0 (Poor) |
+| **WER (Word Error Rate)** | >50% | Likely >80% |
+| **Voice Similarity** | 30-40% | ~20% |
+| **Naturalness** | Very Low | Minimal |
+| **Intelligibility** | Poor | Unintelligible |
+
+#### Recommended Configuration (Expected Quality)
+
+| Metric | Expected | Notes |
+|--------|----------|-------|
+| **MOS** | 3.5-4.2/5.0 | Good to Very Good |
+| **WER** | 15-25% | Intelligible |
+| **Voice Similarity** | 70-85% | High |
+| **Naturalness** | High | Pleasant speech |
+| **Intelligibility** | Excellent | Clear articulation |
+
+### Training Monitoring Checklist
+
+#### During Training
+
+- [ ] Loss decreases gradually (not instantly to 0)
+- [ ] Loss doesn't plateau too early
+- [ ] Learning rate scheduler works correctly
+- [ ] No NaN/Inf gradients
+- [ ] Validation tracks training reasonably
+- [ ] Training logs captured
+
+#### After Training
+
+- [ ] Generate test samples
+- [ ] Conduct subjective evaluation (listen)
+- [ ] Calculate objective metrics (MOS, WER)
+- [ ] Compare with baseline
+- [ ] Test on unseen text
+- [ ] Test different emotions/styles
+
+### Success Metrics
+
+Define success before training:
+
+| Metric | Minimum Acceptable | Target | Excellent |
+|--------|-------------------|--------|-----------|
+| **Final Training Loss** | <0.5 | <0.2 | <0.1 |
+| **Validation Loss** | <1.0 | <0.5 | <0.3 |
+| **MOS Score** | 2.5/5 | 3.5/5 | 4.2/5 |
+| **WER** | <40% | <25% | <15% |
+| **Voice Similarity** | 50% | 70% | 85% |
+
+### Summary of Key Recommendations
+
+#### Must-Do (Critical)
+
+1. ✅ **Fix audio code extraction** - Get unique codes per sample
+2. ✅ **Increase training data** - Use 5000+ samples
+3. ✅ **Use target language reference** - Hausa speaker for Hausa text
+4. ✅ **Lower learning rate** - 3e-5 to 5e-5
+5. ✅ **Train more epochs** - 20-30 epochs
+6. ✅ **Add validation** - Monitor overfitting
+
+#### Should-Do (Important)
+
+7. ✅ **Use smaller batch size** - 1-2 for better generalization
+8. ✅ **Implement gradient accumulation** - Effective batch 16+
+9. ✅ **Add learning rate scheduling** - Cosine annealing
+10. ✅ **Monitor training properly** - Log all metrics
+
+#### Nice-to-Do (Optional)
+
+11. 🔄 Use data augmentation
+12. 🔄 Implement curriculum learning
+13. 🔄 Try adapter/Lora training
+14. 🔄 Multi-speaker training
+
+### Troubleshooting Guide
+
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| **Loss = 0 immediately** | Same codes in all samples | Fix code extraction |
+| **Loss = NaN** | LR too high | Reduce LR, add clipping |
+| **No voice identity** | Wrong reference audio | Use target language speaker |
+| **Poor intelligibility** | Insufficient training | More epochs, more data |
+| **Memory OOM** | Batch too big | Reduce batch, increase grad accum |
+| **Training too slow** | Inefficient pipeline | Optimize dataloader, use pinning |
 
 ## License
 
