@@ -12,6 +12,7 @@ Comprehensive training pipeline for Qwen3-TTS voice cloning with Hausa TTS fine-
 - [Dataset Tool](#dataset-tool)
 - [Training](#training)
   - [Unified Training Script (`train.py`)](#unified-training-script-trainpy)
+  - [Single GPU vs Multi-GPU Training](#single-gpu-vs-multi-gpu-training)
   - [Legacy Training Script (`finetuning/sft_12hz.py`)](#legacy-training-script-finetuningsft_12hzpy)
   - [Training Scripts Comparison](#training-scripts-comparison)
   - [Which Script Should You Use?](#which-script-should-you-use)
@@ -48,6 +49,24 @@ nano .env
 
 # Verify installation
 python test_setup.py
+
+# Or verify using uv run
+uv run test_setup.py
+```
+
+**Using UV:**
+
+The project is configured to work seamlessly with `uv` for dependency management. You can run any script with `uv run <script>` to use the project's virtual environment:
+
+```bash
+# All training commands work with uv run
+uv run train.py                           # Single GPU training
+uv run accelerate launch --num_processes=4 train.py  # Multi-GPU training
+uv run data_processing.py --mode info    # Test data processing
+
+# Or use the convenience scripts
+./uv_train.sh                             # UV-based single GPU
+./uv_train_4gpu.sh                        # UV-based multi-GPU
 ```
 
 ## Quick Start
@@ -56,9 +75,40 @@ python test_setup.py
 # Create .env from template
 cp .env.training.example .env
 
-# Run training
+# Configure your settings
+nano .env
+
+# Training Options:
+
+# Option 1: Using uv run (recommended for UV-managed environments)
+# Single GPU
+uv run train.py
+# Or use the script:
+./uv_train.sh
+
+# Multi-GPU (4 GPUs)
+uv run accelerate launch --num_processes=4 train.py
+# Or use the script:
+./uv_train_4gpu.sh
+
+# Option 2: Using Python directly
+# Single GPU
 python train.py
+# Or use the script:
+./launch_gpu.sh
+
+# Multi-GPU (4 GPUs)
+accelerate launch --num_processes=4 train.py
+# Or use the script:
+./launch_4gpu.sh
 ```
+
+**Training Scripts:**
+- `train.py` - Main training script (supports single/multi-GPU)
+- `uv_train.sh` - UV-based single GPU launch script
+- `uv_train_4gpu.sh` - UV-based multi-GPU launch script
+- `launch_gpu.sh` - Python-based single GPU launch script
+- `launch_4gpu.sh` - Python-based multi-GPU launch script
 
 ## Environment Configuration
 
@@ -222,6 +272,9 @@ Best for: Large datasets, repeated training runs, offline training
 # Prepare all splits to JSONL
 python data_processing.py --mode prepare
 
+# Or with uv run:
+uv run data_processing.py --mode prepare
+
 # Prepare specific split
 python data_processing.py --mode prepare --split train
 
@@ -251,14 +304,31 @@ train_file = preparer.prepare_split("train", max_samples=1000)
 
 ### 2. HFDirectDataLoader - Load directly from HuggingFace
 
-Best for: Quick experiments, small datasets, online training
+Best for: Large datasets (>100k samples), multi-GPU training, online training
+
+**Multi-GPU Support:**
+
+HFDirectDataLoader automatically detects and supports multi-GPU training:
+- Auto-detects device for each distributed process
+- Loads tokenizer on appropriate GPU for each process
+- Streams data to avoid memory issues with large datasets
+- Data sharding handled automatically by Accelerate
 
 ```bash
-# Test direct loading
+# Test direct loading (auto-detects GPU setup)
 python data_processing.py --mode direct --batch_size 4
+
+# Or with uv run:
+uv run data_processing.py --mode direct --batch_size 4
 
 # Test with limited samples
 python data_processing.py --mode direct --max_samples 100
+
+# Test with multi-GPU (each process uses its own tokenizer)
+accelerate launch --num_processes=4 data_processing.py --mode direct --max_samples 100
+
+# Or with uv run:
+uv run accelerate launch --num_processes=4 data_processing.py --mode direct --max_samples 100
 ```
 
 **Usage in Python:**
@@ -266,7 +336,7 @@ python data_processing.py --mode direct --max_samples 100
 ```python
 from data_processing import HFDirectDataLoader, get_dataloader
 
-# Create dataset
+# Single GPU training - device auto-detected
 dataset = HFDirectDataLoader(
     dataset_name="vaghawan/hausa-tts-22k",
     split="train",
@@ -274,23 +344,34 @@ dataset = HFDirectDataLoader(
     max_samples=1000,
 )
 
-# Create dataloader
+# Multi-GPU training - create in each process, device auto-detected
+from accelerate import Accelerator
+accelerator = Accelerator()
+
+# Device automatically detected for this process
+dataset = HFDirectDataLoader(
+    dataset_name="vaghawan/hausa-tts-22k",
+    split="train",
+    tokenizer_path="Qwen/Qwen3-TTS-Tokenizer-12Hz",
+    max_samples=600000,  # Large dataset - streams from HF
+)
+
 dataloader = get_dataloader(
     dataset_name="vaghawan/hausa-tts-22k",
     split="train",
-    batch_size=4,
-    max_samples=1000,
+    batch_size=8,  # Per GPU
+    max_samples=600000,
 )
 
-# Iterate through batches
-for batch in dataloader:
-    for sample in batch:
-        audio_array = sample["audio"]
-        text = sample["text"]
-        audio_codes = sample["audio_codes"]
-        sr = sample["sr"]
-        # ... process for training
+# Prepare for multi-GPU training
+model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 ```
+
+Auto-Detection Features:
+- ✅ Automatic device detection (`get_device_for_current_process()`)
+- ✅ Automatic num_workers based on GPU count (`get_num_workers_for_dataloader()`)
+- ✅ Pin memory enabled by default for GPU training
+- ✅ Compatible with Accelerate's DistributedSampler
 
 ### Get Dataset Information
 
@@ -320,10 +401,19 @@ Both approaches return the same data format:
 
 ### Choosing the Right Approach
 
-| Approach | Best For | Pros | Cons |
-|----------|----------|------|------|
-| **JSONLDataPreparer** | Large datasets, repeated training | Fast loading, offline training, reproducible | Requires storage space, initial preparation time |
-| **HFDirectDataLoader** | Quick experiments, small datasets | No preparation needed, always up-to-date | Slower loading, requires internet |
+| Approach | Best For | Pros | Cons | Multi-GPU |
+|----------|----------|------|------|-----------|
+| **JSONLDataPreparer** | Medium datasets, repeated training | Fast loading, offline training, reproducible | Requires storage space, initial prep time | ❌ Loads all into RAM |
+| **HFDirectDataLoader** | Large datasets, multi-GPU, online training | Minimal RAM, auto-detects GPU, streams data | Slower first iteration, requires HF access | ✅ Full support, auto-detection |
+
+**Multi-GPU Recommendations:**
+
+| Dataset Size | Recommended Mode | Configuration |
+|--------------|------------------|---------------|
+| < 10k samples | JSONL or Direct | `DATA_MODE=jsonl` or `direct` |
+| 10k - 100k samples | JSONL or Direct | `DATA_MODE=jsonl` or `direct` |
+| > 100k samples | ✅ **Direct (Required)** | `DATA_MODE=direct` - JSONL will cause OOM |
+| 600k samples | ✅ **Direct (Required)** | `DATA_MODE=direct` + multi-GPU |
 
 ## Training
 
@@ -660,7 +750,387 @@ output/
 | **Default Model** | 12Hz or 25Hz (configurable) | 12Hz only |
 | **Speaker Encoder Freeze** | Configurable | Configurable |
 | **Layer Replacement** | ✅ Yes | ✅ Yes |
+| **Multi-GPU Support** | ✅ Yes (via Accelerate) | ❌ No |
 | **Recommended For** | Production training | Quick experiments |
+
+### Single GPU vs Multi-GPU Training
+
+The `train.py` script supports both single GPU and multi-GPU distributed training using Hugging Face Accelerate.
+
+#### Overview
+
+| Aspect | Single GPU | Multi-GPU (4x GPUs) |
+|--------|-----------|-------------------|
+| **Setup** | `python train.py` | `accelerate launch --num_processes=4 train.py` |
+| **Batch Size** | Per GPU batch size | Per GPU batch size (effective: × num_gpus) |
+| **Learning Rate** | Base LR | Scaled LR (recommended: × #GPUs/4) |
+| **Memory** | Single GPU memory | Distributed across GPUs |
+| **Training Speed** | Baseline | ~3.5-4x faster (near-linear scaling) |
+| **Data Loading** | Sequential | Distributed (automatic sharding) |
+
+#### Single GPU Training
+
+For single GPU training, you can use any of these methods:
+
+**Method 1: Using uv run (Recommended for UV-managed environments)**
+
+```bash
+# Run with uv
+uv run train.py
+
+# Or use the convenience script
+./uv_train.sh
+
+# With specific GPU
+CUDA_VISIBLE_DEVICES=0 uv run train.py
+```
+
+**Method 2: Using Python directly**
+
+```bash
+python train.py
+
+# Or use the convenience script
+./launch_gpu.sh
+```
+
+**Recommended configuration for single 16GB GPU:**
+
+```bash
+# .env configuration
+BATCH_SIZE=4
+LEARNING_RATE=3e-4
+NUM_EPOCHS=3
+GRADIENT_ACCUMULATION_STEPS=1
+WARMUP_STEPS=500
+```
+
+**Data mode recommendation:**
+- Small datasets (< 10k samples): Use `DATA_MODE=jsonl` (load into RAM)
+- Medium datasets (10k-100k): Use `DATA_MODE=jsonl` or `direct`
+- Large datasets (> 100k): Use `DATA_MODE=direct` (streaming)
+
+#### Multi-GPU Training
+
+For multi-GPU training, you can use any of these methods:
+
+**Method 1: Using uv run with accelerate (Recommended for UV-managed environments)**
+
+```bash
+# Basic multi-GPU launch (4 GPUs)
+uv run accelerate launch --num_processes=4 train.py
+
+# Or use the convenience script
+./uv_train_4gpu.sh
+
+# With specific GPU selection
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run accelerate launch --num_processes=4 train.py
+
+# With all environment variables
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+uv run accelerate launch \
+    --num_processes=4 \
+    --num_machines=1 \
+    --mixed_precision="bf16" \
+    --dynamo_backend="no" \
+    train.py
+```
+
+**Method 2: Using Python directly with accelerate**
+
+```bash
+# Basic multi-GPU launch (4 GPUs)
+accelerate launch --num_processes=4 train.py
+
+# With specific GPU selection
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --num_processes=4 train.py
+
+# With all environment variables
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+accelerate launch --num_processes=4 \
+    --num_machines=1 \
+    --mixed_precision="bf16" \
+    --dynamo_backend="no" \
+    train.py
+```
+
+**Method 3: Using Python convenience script**
+
+```bash
+# Use the existing launch script
+./launch_4gpu.sh
+```
+
+**Recommended configuration for 4x 16GB GPUs:**
+
+```bash
+# .env configuration
+DATA_MODE=direct                    # Required for large datasets
+BATCH_SIZE=8                        # Per GPU (32 total effective batch size)
+LEARNING_RATE=1e-3                  # Scaled for multi-GPU
+NUM_EPOCHS=3
+GRADIENT_ACCUMULATION_STEPS=1       # No accumulation needed
+WARMUP_STEPS=1000                   # Increased warmup
+MIXED_PRECISION=bf16                # Critical for efficiency
+```
+
+**Large dataset configuration (600k training / 30k validation):**
+
+```bash
+# .env file
+DATA_MODE=direct
+DATASET_NAME=your_dataset_name      # Must be on HuggingFace
+MAX_TRAIN_SAMPLES=600000
+MAX_EVAL_SAMPLES=30000
+BATCH_SIZE=8
+LEARNING_RATE=1e-3
+NUM_EPOCHS=3
+GRADIENT_ACCUMULATION_STEPS=1
+WARMUP_STEPS=1000
+LOGGING_STEPS=100
+SAVE_STEPS=2500                     # Less frequent for long training
+EVAL_STEPS=2500
+SAVE_TOTAL_LIMIT=5
+MIXED_PRECISION=bf16
+```
+
+#### Multi-GPU Launch Script
+
+You can use any of these convenient scripts for multi-GPU training:
+
+**Option 1: UV-based launch script (Recommended for UV-managed environments)**
+
+The project includes `uv_train_4gpu.sh` which uses `uv run` internally:
+
+```bash
+# Make executable (first time only)
+chmod +x uv_train_4gpu.sh
+
+# Run training
+./uv_train_4gpu.sh
+```
+
+The UV-based script automatically:
+- Checks if uv is installed
+- Verifies accelerate is available
+- Shows GPU status
+- Launches training with `uv run accelerate launch`
+
+**Option 2: Python-based launch script**
+
+For environments not using UV, use `launch_4gpu.sh`:
+
+```bash
+# Make executable (first time only)
+chmod +x launch_4gpu.sh
+
+# Run training
+./launch_4gpu.sh
+```
+
+The Python-based script:
+- Checks accelerate installation
+- Shows GPU status
+- Launches training with `accelerate launch`
+
+**Option 3: Manual launch script**
+
+Create a custom `launch_4gpu_manual.sh` script:
+
+```bash
+#!/bin/bash
+
+# Set GPU visibility
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+# Environment variables for distributed training
+export NCCL_DEBUG=INFO              # NCCL debugging (optional)
+export OMP_NUM_THREADS=4            # Thread count per process
+
+# Choose launch method:
+# UV-managed:
+uv run accelerate launch \
+    --num_processes=4 \
+    --num_machines=1 \
+    --mixed_precision="bf16" \
+    --dynamo_backend="no" \
+    train.py
+
+# Or Python (uncomment the line below):
+# accelerate launch \
+#     --num_processes=4 \
+#     --num_machines=1 \
+#     --mixed_precision="bf16" \
+#     --dynamo_backend="no" \
+#     train.py
+```
+
+#### Data Loading for Large Datasets
+
+**Critical**: For datasets > 100k samples, you MUST use `DATA_MODE=direct`:
+
+```bash
+# ❌ DON'T use jsonl mode for large datasets (will cause OOM)
+DATA_MODE=jsonl
+MAX_TRAIN_SAMPLES=600000           # Will crash - loads all into RAM
+
+# ✅ DO use direct mode for streaming
+DATA_MODE=direct
+DATASET_NAME=your-dataset          # Streams from HuggingFace
+MAX_TRAIN_SAMPLES=600000           # Efficient streaming
+```
+
+If your dataset is not on HuggingFace, you can:
+
+1. **Push to HuggingFace** (recommended):
+```bash
+huggingface-cli login
+# Use datasets library to upload your data
+```
+
+2. **Use WebDataset format** (advanced):
+   - Convert to sharded `.tar` files
+   - Use WebDataset library for streaming
+
+3. **Modify the dataloader** to stream from your custom source
+
+#### Learning Rate Scaling
+
+When scaling to multiple GPUs, adjust the learning rate using the **linear scaling rule**:
+
+**Formula**: `LR_multi_gpu = LR_single_gpu × (batch_size_multi_gpu / batch_size_single_gpu)`
+
+**Example**:
+- Single GPU: batch_size=4, LR=3e-4
+- 4 GPUs: batch_size=32 (4×8), LR=3e-4 × (32/4) = 2.4e-3
+
+**Conservative approach (recommended)**: Scale by 2-3x instead of full 8x:
+- Single GPU: 3e-4
+- 4 GPUs: 1e-3 (instead of 2.4e-3)
+
+#### Training Time Estimates
+
+| Configuration | Dataset Size | Steps per Epoch | Total Steps | Training Time |
+|--------------|--------------|-----------------|-------------|---------------|
+| 1× GPU, batch=4 | 10k | 2,500 | 7,500 | 4-6 hours |
+| 1× GPU, batch=4 | 70k | 17,500 | 52,500 | 28-40 hours |
+| 4× GPU, batch=8 | 70k | 2,188 | 6,563 | 8-12 hours |
+| 4× GPU, batch=8 | 600k | 18,750 | 56,250 | 32-47 hours |
+
+#### Memory Requirements
+
+**Per GPU Memory:**
+
+| Component | Single GPU | Multi-GPU (per GPU) |
+|-----------|-----------|-------------------|
+| Model weights | ~6 GB | ~6 GB |
+| Batch (batch=4) | ~4 GB | ~8 GB (for batch=8) |
+| Activations | ~2 GB | ~2 GB |
+| Gradients | ~1 GB | ~1 GB |
+| Overhead | ~1 GB | ~1 GB |
+| **Total** | ~14 GB | ~18 GB ⚠️ |
+
+For 16GB GPUs with batch_size=8, you may be close to the limit. If you encounter OOM errors:
+
+```bash
+# Option 1: Reduce batch size
+BATCH_SIZE=4                      # Reduced batch
+GRADIENT_ACCUMULATION_STEPS=2    # Maintain effective batch size
+
+# Option 2: Use gradient checkpointing (if supported)
+# Add to model configuration
+```
+
+#### Monitoring Multi-GPU Training
+
+**Watch GPU utilization:**
+
+```bash
+# Terminal 1: Monitor all GPUs
+watch -n 1 nvidia-smi
+
+# Terminal 2: Monitor training logs
+tail -f output/training_log.jsonl
+
+# Terminal 3: Monitor WandB
+# Visit wandb.ai for live metrics
+```
+
+**Expected training behavior:**
+
+- **GPU Utilization**: All 4 GPUs should show 90-100% during training
+- **Memory Usage**: Consistent ~14-18 GB per GPU
+- **Speed**: ~3.5-4x faster than single GPU
+- **Loss Pattern**: Similar to single GPU but reaches target faster
+
+#### Troubleshooting Multi-GPU Issues
+
+**Issue: Only 1 GPU is being used**
+
+```bash
+# Check available GPUs
+nvidia-smi
+
+# Verify accelerate configuration
+accelerate config
+
+# Manually specify GPU count
+accelerate launch --num_processes=4 train.py
+```
+
+**Issue: NCCL communication errors**
+
+```bash
+# Add to launch script
+export NCCL_IB_DISABLE=1
+export NCCL_SOCKET_IFNAME=eth0
+
+# Or use gloo instead of NCCL (slower but more compatible)
+accelerate launch --num_processes=4 --multi_gpu backend=gloo train.py
+```
+
+**Issue: Out of Memory**
+
+```bash
+# Reduce batch size
+BATCH_SIZE=4
+GRADIENT_ACCUMULATION_STEPS=2
+
+# Or enable gradient checkpointing in model config
+```
+
+**Issue: Data loading bottleneck**
+
+```bash
+# Increase num_workers
+NUM_WORKERS=8  # More workers for multi-GPU
+
+# Or use direct mode with streaming
+DATA_MODE=direct
+```
+
+#### Performance Optimization Tips
+
+1. **Enable mixed precision**: Always use `MIXED_PRECISION=bf16` for multi-GPU
+2. **Pin memory**: DataLoader uses `pin_memory=True` by default
+3. **Increase num_workers**: 2 workers per GPU (8 workers for 4 GPUs)
+4. **Use direct mode**: For large datasets to avoid loading everything into RAM
+5. **Adjust logging frequency**: Less frequent logs for long training runs
+6. **Optimize checkpoint frequency**: `SAVE_STEPS=2500` for 50k+ steps
+
+#### Pre-flight Checklist for Multi-GPU Training
+
+Before starting multi-GPU training:
+
+- [ ] All GPUs visible: `nvidia-smi -L` shows all GPUs
+- [ ] Accelerate installed: `uv run -c "import accelerate; print(accelerate.__version__)"` or `accelerate --version`
+- [ ] UV installed (if using UV-based scripts): `uv --version`
+- [ ] Dataset accessible: Test with `uv run data_processing.py --mode info`
+- [ ] Sufficient disk space: 50-70 GB free
+- [ ] Memory available: Check per-GPU memory with nvidia-smi
+- [ ] NCCL working: Test quick multi-GPU run (10 steps)
+- [ ] WandB configured: If using tracking
+- [ ] HuggingFace token ready: If uploading
 
 ### Which Script Should You Use?
 

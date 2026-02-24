@@ -7,6 +7,12 @@ Provides two approaches for data handling:
 1. JSONLDataPreparer: Prepare data from HuggingFace to JSONL with audio codes
 2. HFDirectDataLoader: Load data directly from HuggingFace for on-the-fly processing
 
+Multi-GPU Support:
+This module automatically detects multi-GPU training and loads the tokenizer
+on the appropriate device for each distributed process. When using Accelerate
+for distributed training, each process will have its own tokenizer instance
+on its assigned GPU.
+
 Configuration is read from .env file.
 """
 
@@ -33,6 +39,85 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Qwen3-TTS", "finetun
 
 from qwen_tts import Qwen3TTSTokenizer
 
+
+def get_device_for_current_process() -> str:
+    """
+    Get the appropriate device for the current process in distributed training.
+
+    This function detects if we're running in a multi-GPU distributed training
+    environment and returns the correct device for the current process.
+
+    Returns:
+        Device string ('cuda:0', 'cuda:1', 'cuda', or 'cpu')
+    """
+    # Check if we're using accelerate for distributed training
+    try:
+        from accelerate import Accelerator
+
+        accelerator = Accelerator()
+        process_index = accelerator.process_index
+        num_processes = accelerator.num_processes
+
+        if num_processes > 1:
+            # Multi-GPU training: each process uses its own GPU
+            device = f"cuda:{process_index}"
+            print(f"📊 Multi-GPU detected! Process {process_index}/{num_processes} using device: {device}")
+            return device
+    except:
+        pass
+
+    # Check CUDA availability
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        if num_gpus > 1:
+            # Multiple GPUs available but not using distributed training
+            # Use the first GPU or CUDA_VISIBLE_DEVICES environment variable
+            visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if visible_devices:
+                # Use the first visible GPU
+                device = f"cuda:0"
+                print(f"📊 {num_gpus} GPUs available (visible: {visible_devices}), using: {device}")
+            else:
+                device = "cuda"
+                print(f"📊 {num_gpus} GPUs available, using default: {device}")
+        else:
+            device = "cuda"
+            print(f"📊 Single GPU available: {device}")
+    else:
+        device = "cpu"
+        print(f"⚠ No GPU available, using CPU")
+
+    return device
+
+
+def get_num_workers_for_dataloader(num_gpus: int = None) -> int:
+    """
+    Get recommended number of workers for DataLoader based on GPU setup.
+
+    Args:
+        num_gpus: Number of GPUs (auto-detected if None)
+
+    Returns:
+        Recommended number of workers
+    """
+    if num_gpus is None:
+        if torch.cuda.is_available():
+            num_gpus = torch.cuda.device_count()
+        else:
+            num_gpus = 1
+
+    # Use 2 workers per GPU, capped at 8
+    recommended = min(2 * num_gpus, 8)
+
+    # For CPU-only or small systems, use fewer workers
+    import multiprocessing
+    total_cpus = multiprocessing.cpu_count()
+    if total_cpus < 8:
+        recommended = min(recommended, total_cpus // 2)
+
+    return max(0, min(recommended, total_cpus))
+
+
 # Configuration from .env
 DATASET_NAME = os.getenv("DATASET_NAME", "vaghawan/hausa-tts-22k")
 TRAIN_SPLIT = os.getenv("TRAIN_SPLIT", "train")
@@ -55,14 +140,24 @@ class JSONLDataPreparer:
     - Encodes audio to codes using Qwen3-TTS tokenizer
     - Saves to JSONL files for fast loading during training
     - Best for: Large datasets, repeated training runs, offline training
+    - Compatible with both single and multi-GPU training
+
+    Multi-GPU Notes:
+    - Data preparation should be done on a single GPU before distributed training
+    - All processes will load and shard the same JSONL files during training
+    - For >100k samples, consider using HFDirectDataLoader instead (DATA_MODE=direct)
 
     Usage:
+        # Single GPU data preparation
         preparer = JSONLDataPreparer(
             dataset_name="vaghawan/hausa-tts-22k",
             output_dir="./data",
             tokenizer_path="Qwen/Qwen3-TTS-Tokenizer-12Hz"
         )
         output_files = preparer.prepare_all_splits()
+
+        # Then train with multi-GPU:
+        # accelerate launch --num_processes=4 train.py
     """
 
     def __init__(
@@ -326,15 +421,26 @@ class HFDirectDataLoader(TorchDataset):
     - Loads data directly from HuggingFace during training
     - Encodes audio to codes on-the-fly
     - No intermediate JSONL files needed
-    - Best for: Quick experiments, small datasets, online training
+    - Best for: Large datasets (>100k samples), multi-GPU training, online training
+
+    Multi-GPU Support:
+    - Automatically detects multi-GPU training and loads tokenizer on appropriate device
+    - Each process loads its own tokenizer instance on its assigned GPU
+    - Data is automatically sharded by Accelerate's DistributedSampler
+    - Streams data from HuggingFace to avoid memory issues with large datasets
 
     Usage:
+        # Single GPU
         dataset = HFDirectDataLoader(
             dataset_name="vaghawan/hausa-tts-22k",
             split="train",
             tokenizer_path="Qwen/Qwen3-TTS-Tokenizer-12Hz"
         )
         dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+
+        # Multi-GPU (automatically detected via Accelerate)
+        # Run: accelerate launch --num_processes=4 train.py
+        # The dataset will automatically use the correct GPU for each process
     """
 
     def __init__(
@@ -361,12 +467,16 @@ class HFDirectDataLoader(TorchDataset):
                 "voices", "english_voice", "english_voice_24k.wav"
             )
 
+        # Auto-detect device for multi-GPU training
+        self.audio_sr_device = get_device_for_current_process()
+
         print("="*60)
         print(f"Loading {split} dataset from HuggingFace (Direct)")
         print("="*60)
         print(f"Dataset: {dataset_name}")
         print(f"Split: {split}")
         print(f"Max samples: {max_samples if max_samples else 'All'}")
+        print(f"Device: {self.audio_sr_device}")
         print("="*60)
 
         # Load dataset
@@ -379,13 +489,14 @@ class HFDirectDataLoader(TorchDataset):
 
         print(f"✓ Loaded {len(self.hf_dataset)} samples")
 
-        # Load tokenizer
+        # Load tokenizer on the appropriate device
         print(f"\nLoading Qwen3-TTS tokenizer from {tokenizer_path}...")
+        print(f"   Loading on device: {self.audio_sr_device}")
         self.tokenizer = Qwen3TTSTokenizer.from_pretrained(
             tokenizer_path,
-            device_map=audio_sr_device,
+            device_map=self.audio_sr_device,
         )
-        print(f"✓ Tokenizer loaded on {audio_sr_device}")
+        print(f"✓ Tokenizer loaded on {self.audio_sr_device}")
 
         print("="*60)
         print("Dataset ready!")
@@ -478,13 +589,26 @@ def get_dataloader(
     tokenizer_path: str = TOKENIZER_PATH,
     ref_audio_path: Optional[str] = REF_AUDIO_PATH,
     max_samples: Optional[int] = None,
-    audio_sr_device: str = DEVICE,
-    num_workers: int = 0,
+    audio_sr_device: Optional[str] = None,
+    num_workers: Optional[int] = None,
     shuffle: bool = True,
     cache_dir: Optional[str] = None,
 ) -> TorchDataLoader:
     """
     Create a PyTorch DataLoader for training or evaluation using direct HuggingFace loading.
+
+    This function automatically detects multi-GPU training and:
+    - Loads the tokenizer on the appropriate device for each process
+    - Sets optimal num_workers based on GPU count
+    - Streams data from HuggingFace to avoid memory issues
+
+    Multi-GPU Usage:
+        # In train.py, use:
+        from accelerate import Accelerator
+        accelerator = Accelerator()
+        
+        dataloader = get_dataloader(...)  # Auto-detects multi-GPU
+        model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
     Args:
         dataset_name: HuggingFace dataset name
@@ -493,27 +617,35 @@ def get_dataloader(
         tokenizer_path: Path to Qwen3-TTS tokenizer
         ref_audio_path: Reference audio path for voice cloning
         max_samples: Maximum number of samples
-        audio_sr_device: Device for audio processing
-        num_workers: Number of workers for data loading
+        audio_sr_device: Device for audio processing (auto-detected if None)
+        num_workers: Number of workers for data loading (auto-detected if None)
         shuffle: Whether to shuffle the data
         cache_dir: Optional cache directory
 
     Returns:
         PyTorch DataLoader ready for training
     """
+    # Auto-detect number of workers
+    if num_workers is None:
+        if torch.cuda.is_available():
+            num_gpus = torch.cuda.device_count()
+            num_workers = get_num_workers_for_dataloader(num_gpus)
+        else:
+            num_workers = 0
+
     if split == "train":
         max_samples = max_samples or MAX_TRAIN_SAMPLES
     else:
         max_samples = max_samples or MAX_EVAL_SAMPLES
 
-    # Create dataset
+    # Create dataset (device auto-detected internally)
     dataset = HFDirectDataLoader(
         dataset_name=dataset_name,
         split=split,
         tokenizer_path=tokenizer_path,
         ref_audio_path=ref_audio_path,
         max_samples=max_samples,
-        audio_sr_device=audio_sr_device,
+        audio_sr_device=audio_sr_device,  # Will be auto-detected if None
         cache_dir=cache_dir,
     )
 
@@ -523,7 +655,7 @@ def get_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True if audio_sr_device == "cuda" else False,
+        pin_memory=True if torch.cuda.is_available() else False,
         drop_last=False,
     )
 
@@ -534,16 +666,21 @@ def get_dataloader(
 
 def get_train_dataloader(
     batch_size: int = 2,
-    num_workers: int = 0,
+    num_workers: int = None,
     shuffle: bool = True,
     **kwargs
 ) -> TorchDataLoader:
     """
     Create training DataLoader with default settings from .env.
 
+    Automatically detects multi-GPU training and:
+    - Uses appropriate device for each process
+    - Sets optimal num_workers based on GPU count
+    - Streams data from HuggingFace
+
     Args:
         batch_size: Batch size
-        num_workers: Number of workers
+        num_workers: Number of workers (auto-detected if None)
         shuffle: Whether to shuffle
         **kwargs: Additional arguments for get_dataloader
 
@@ -557,8 +694,8 @@ def get_train_dataloader(
         tokenizer_path=TOKENIZER_PATH,
         ref_audio_path=REF_AUDIO_PATH,
         max_samples=MAX_TRAIN_SAMPLES,
-        audio_sr_device=DEVICE,
-        num_workers=num_workers,
+        audio_sr_device=None,  # Auto-detected
+        num_workers=num_workers,  # Auto-detected if None
         shuffle=shuffle,
         **kwargs
     )
@@ -566,16 +703,21 @@ def get_train_dataloader(
 
 def get_eval_dataloader(
     batch_size: int = 2,
-    num_workers: int = 0,
+    num_workers: int = None,
     shuffle: bool = False,
     **kwargs
 ) -> TorchDataLoader:
     """
     Create evaluation DataLoader with default settings from .env.
 
+    Automatically detects multi-GPU training and:
+    - Uses appropriate device for each process
+    - Sets optimal num_workers based on GPU count
+    - Streams data from HuggingFace
+
     Args:
         batch_size: Batch size
-        num_workers: Number of workers
+        num_workers: Number of workers (auto-detected if None)
         shuffle: Whether to shuffle (usually False for eval)
         **kwargs: Additional arguments for get_dataloader
 
@@ -589,8 +731,8 @@ def get_eval_dataloader(
         tokenizer_path=TOKENIZER_PATH,
         ref_audio_path=REF_AUDIO_PATH,
         max_samples=MAX_EVAL_SAMPLES,
-        audio_sr_device=DEVICE,
-        num_workers=num_workers,
+        audio_sr_device=None,  # Auto-detected
+        num_workers=num_workers,  # Auto-detected if None
         shuffle=shuffle,
         **kwargs
     )
@@ -711,15 +853,21 @@ def main():
         split = args.split or TRAIN_SPLIT
         max_samples = args.max_samples or MAX_TRAIN_SAMPLES
 
+        # Auto-detect num_workers if not specified
+        num_workers = args.num_workers if args.num_workers is not None else None
+
         dataloader = get_dataloader(
             dataset_name=DATASET_NAME,
             split=split,
             batch_size=args.batch_size,
             max_samples=max_samples,
-            num_workers=args.num_workers,
+            num_workers=num_workers,
         )
 
         print(f"\nTesting DataLoader with {len(dataloader)} batches...")
+        print(f"   Batch size: {args.batch_size}")
+        print(f"   Num workers: {dataloader.num_workers}")
+        print(f"   Pin memory: {dataloader.pin_memory}")
 
         # Iterate first batch to test
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Testing dataloader")):

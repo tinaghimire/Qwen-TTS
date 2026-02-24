@@ -17,6 +17,45 @@ Features:
 - Validation loss and metrics logging to validation_log.jsonl
 - WandB tracking
 - Best and last model checkpointing
+- Multi-GPU support via HuggingFace Accelerate
+
+Multi-GPU Training:
+This script supports distributed training across multiple GPUs using Accelerate.
+
+Single GPU Training:
+    python train.py
+
+Multi-GPU Training (4 GPUs):
+    accelerate launch --num_processes=4 train.py
+
+    Or with explicit GPU selection:
+    CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --num_processes=4 train.py
+
+Multi-GPU Configuration Recommendations:
+For 4x GPUs with large datasets (600k+ samples), set in .env:
+    DATA_MODE=direct                        # Required for large datasets
+    BATCH_SIZE=8                            # Per GPU (32 total effective batch)
+    LEARNING_RATE=1e-3                      # Scaled for multi-GPU
+    NUM_EPOCHS=3
+    GRADIENT_ACCUMULATION_STEPS=1           # No accumulation with 4 GPUs
+    WARMUP_STEPS=1000                       # Increased warmup for larger batch
+    MIXED_PRECISION=bf16                    # Critical for multi-GPU efficiency
+
+Data Mode Selection:
+    - JSONL mode (DATA_MODE=jsonl):
+        * Best for: Small to medium datasets (<100k samples)
+        * Loads all data into RAM at once
+        * Fast data loading but memory intensive
+        * NOT recommended for >100k samples (will cause OOM)
+
+    - Direct mode (DATA_MODE=direct):
+        * Best for: Large datasets (>100k samples) or multi-GPU training
+        * Streams data from HuggingFace Hub
+        * Uses minimal RAM regardless of dataset size
+        * REQUIRED for 600k+ samples to avoid memory issues
+        * Dataset must be available on HuggingFace Hub
+
+For more details on multi-GPU training, see the README.md documentation.
 """
 
 import json
@@ -41,6 +80,10 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 import wandb
 
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)    
+
 # Add paths
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Qwen3-TTS"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Qwen3-TTS", "finetuning"))
@@ -52,7 +95,7 @@ from finetuning.dataset import TTSDataset
 from finetuning.layer_utils import replace_and_add_layers, print_model_summary, get_trainable_params
 
 # Load environment variables
-load_dotenv()
+load_dotenv(override=True)
 
 
 @dataclass
@@ -129,7 +172,6 @@ class TrainingConfig:
     # Reference Audio - Reference audio for speaker cloning
     
     ref_audio_path: Optional[str] = os.getenv("REF_AUDIO_PATH", None)  # Path to reference audio file (optional)
-    ref_text: str = os.getenv("REF_TEXT", "MTN Entertainment and Lifestyle. Entertainment and Lifestyle are at the heart of MTN's offering. We bring you music, movies, games and more through our digital platforms. With MTN musicals, you can stream your favorite")  # Reference text for ICL (optional)
 
 
 class Logger:
@@ -149,9 +191,11 @@ class Logger:
             "step": step,
             "epoch": epoch,
             "loss": loss,
-            "learning_rate": learning_rate,
+            "learning_rate": float(f"{learning_rate:.10e}"),  # Ensure full scientific notation
             "timestamp": datetime.datetime.now().isoformat(),
-            **kwargs
+            "progress_pct": kwargs.get("progress_pct", 0),
+            "epoch_progress": kwargs.get("epoch_progress", 0),
+            **{k: v for k, v in kwargs.items() if k not in ["progress_pct", "epoch_progress"]}
         }
         
         with open(self.training_log_file, 'a') as f:
@@ -240,13 +284,23 @@ class DataProcessor:
             train_data = []
             with open(self.config.train_jsonl, 'r') as f:
                 for line in f:
-                    train_data.append(json.loads(line))
+                    line = line.strip()
+                    if line:  # Skip empty lines
+                        train_data.append(json.loads(line))
             
             if self.config.max_train_samples:
                 train_data = train_data[:self.config.max_train_samples]
             
             dataset = TTSDataset(train_data, model.processor, config)
-            return DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
+            return DataLoader(
+                dataset,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                collate_fn=dataset.collate_fn,
+                num_workers=4,  # Parallel data loading
+                pin_memory=True,  # Faster GPU transfer
+                prefetch_factor=2  # Prefetch batches
+            )
         
         elif self.config.data_mode == "direct":
             # Load directly from HuggingFace
@@ -274,13 +328,23 @@ class DataProcessor:
             val_data = []
             with open(self.config.validation_jsonl, 'r') as f:
                 for line in f:
-                    val_data.append(json.loads(line))
+                    line = line.strip()
+                    if line:  # Skip empty lines
+                        val_data.append(json.loads(line))
             
             if self.config.max_eval_samples:
                 val_data = val_data[:self.config.max_eval_samples]
             
             dataset = TTSDataset(val_data, model.processor, config)
-            return DataLoader(dataset, batch_size=self.config.batch_size, shuffle=False, collate_fn=dataset.collate_fn)
+            return DataLoader(
+                dataset,
+                batch_size=self.config.batch_size,
+                shuffle=False,
+                collate_fn=dataset.collate_fn,
+                num_workers=2,  # Fewer workers for eval
+                pin_memory=True,  # Faster GPU transfer
+                prefetch_factor=2  # Prefetch batches
+            )
         
         elif self.config.data_mode == "direct":
             # Load directly from HuggingFace
@@ -311,7 +375,7 @@ class Trainer:
         # Initialize accelerator
         self.accelerator = Accelerator(
             gradient_accumulation_steps=config.gradient_accumulation_steps,
-            mixed_precision=config.mixed_precision,
+            mixed_precision="no",  # Disable mixed precision - use model's native dtype
             log_with="wandb" if config.use_wandb else None,
         )
         
@@ -334,7 +398,7 @@ class Trainer:
         try:
             model = Qwen3TTSModel.from_pretrained(
                 self.config.init_model_path,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.float32,
                 attn_implementation="flash_attention_2",
             )
             print(f"✓ Model loaded with flash_attention_2")
@@ -343,7 +407,7 @@ class Trainer:
             print(f"   (You can install flash-attn for potentially faster training)")
             model = Qwen3TTSModel.from_pretrained(
                 self.config.init_model_path,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.float32,
                 attn_implementation="sdpa",
             )
             print(f"✓ Model loaded with SDPA (Scaled Dot Product Attention)")
@@ -352,20 +416,23 @@ class Trainer:
             print(f"   Trying SDPA fallback...")
             model = Qwen3TTSModel.from_pretrained(
                 self.config.init_model_path,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.float32,
                 attn_implementation="sdpa",
             )
             print(f"✓ Model loaded with SDPA")
         
+        # Model will be cast to bf16 by accelerator, no manual casting needed
+        print(f"✓ Model ready for bf16 mixed precision training")
+        
         # Freeze or unfreeze speaker encoder
         if self.config.freeze_speaker_encoder:
             print(f"\nFreezing speaker encoder...")
-            for param in model.speaker_encoder.parameters():
+            for param in model.model.speaker_encoder.parameters():
                 param.requires_grad = False
             print(f"✓ Speaker encoder frozen")
         else:
             print(f"\nUnfreezing speaker encoder for finetuning...")
-            for param in model.speaker_encoder.parameters():
+            for param in model.model.speaker_encoder.parameters():
                 param.requires_grad = True
             print(f"✓ Speaker encoder unfrozen (gradients will flow)")
         
@@ -405,7 +472,7 @@ class Trainer:
             'other': 0
         }
         
-        for name, param in model.named_parameters():
+        for name, param in model.model.named_parameters():
             total_params += param.numel()
             if param.requires_grad:
                 trainable_params += param.numel()
@@ -439,7 +506,7 @@ class Trainer:
         print("="*60)
         
         # Setup optimizer and scheduler
-        optimizer = AdamW(model.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
+        optimizer = AdamW(model.model.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
         
         total_steps = len(train_dataloader) * self.config.num_epochs
         scheduler = get_cosine_schedule_with_warmup(
@@ -456,13 +523,24 @@ class Trainer:
         if eval_dataloader:
             eval_dataloader = self.accelerator.prepare(eval_dataloader)
         
-        model.train()
+        model.model.train()
         global_step = 0
+        total_steps = len(train_dataloader) * self.config.num_epochs
         
         for epoch in range(self.config.num_epochs):
-            print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch + 1}/{self.config.num_epochs}")
+            print(f"{'='*60}")
             
-            for step, batch in enumerate(train_dataloader):
+            # Create progress bar for this epoch
+            pbar = tqdm(
+                train_dataloader,
+                desc=f"Epoch {epoch + 1}/{self.config.num_epochs}",
+                unit="batch",
+                disable=not self.accelerator.is_main_process
+            )
+            
+            for step, batch in enumerate(pbar):
                 with self.accelerator.accumulate(model):
                     loss = self.training_step(model, batch)
                     
@@ -470,7 +548,7 @@ class Trainer:
                     self.accelerator.backward(loss)
                     
                     if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(model.parameters(), self.config.max_grad_norm)
+                        self.accelerator.clip_grad_norm_(model.model.parameters(), self.config.max_grad_norm)
                     
                     optimizer.step()
                     scheduler.step()
@@ -478,49 +556,110 @@ class Trainer:
                 
                 global_step += 1
                 
-                # Logging
+                # Calculate progress percentage
+                progress_pct = (global_step / total_steps) * 100
+                epoch_progress = ((step + 1) / len(train_dataloader)) * 100
+                
+                # Update progress bar
+                current_lr = scheduler.get_last_lr()[0]
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'lr': f'{current_lr:.2e}',
+                    'progress': f'{progress_pct:.1f}%'
+                })
+                
+                # Log to WandB at every step for clear graph visualization
+                if self.config.use_wandb:
+                    self.accelerator.log({
+                        "train/loss": loss.item(),
+                        "train/learning_rate": current_lr,
+                        "train/epoch": epoch,
+                        "train/global_step": global_step,
+                        "train/progress_pct": progress_pct,
+                        "train/epoch_progress": epoch_progress
+                    }, step=global_step)
+                
+                # Log to file and print progress at configured intervals
                 if global_step % self.config.logging_steps == 0:
-                    current_lr = scheduler.get_last_lr()[0]
                     self.logger.log_training(
                         step=global_step,
                         epoch=epoch,
                         loss=loss.item(),
-                        learning_rate=current_lr
+                        learning_rate=current_lr,
+                        progress_pct=progress_pct,
+                        epoch_progress=epoch_progress
                     )
                     
-                    if self.config.use_wandb:
-                        self.accelerator.log({
-                            "train/loss": loss.item(),
-                            "train/learning_rate": current_lr,
-                            "train/epoch": epoch,
-                            "train/global_step": global_step
-                        }, step=global_step)
-                    
                     if self.accelerator.is_main_process:
-                        print(f"Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f} | LR: {current_lr:.2e}")
+                        print(f"\n{'='*60}")
+                        print(f"📊 Training Progress - Step {global_step}/{total_steps}")
+                        print(f"{'='*60}")
+                        print(f"  Overall Progress: {progress_pct:.2f}%")
+                        print(f"  Epoch {epoch + 1} Progress: {epoch_progress:.2f}% ({step + 1}/{len(train_dataloader)} steps)")
+                        print(f"  Loss: {loss.item():.4f}")
+                        print(f"  Learning Rate: {current_lr:.10e}")
+                        print(f"{'='*60}")
                 
                 # Evaluation
                 if eval_dataloader and global_step % self.config.eval_steps == 0:
+                    print(f"\n{'='*60}")
+                    print(f"🔍 Running Validation at Step {global_step}")
+                    print(f"{'='*60}")
                     val_loss, val_metrics = self.evaluate(model, eval_dataloader, global_step, epoch)
+                    
+                    if self.accelerator.is_main_process:
+                        print(f"\n{'='*60}")
+                        print(f"📈 Validation Results - Step {global_step}")
+                        print(f"{'='*60}")
+                        print(f"  Validation Loss: {val_loss:.4f}")
+                        print(f"  Validation Perplexity: {val_metrics['perplexity']:.4f}")
+                        print(f"  Speaker Embedding Consistency: {val_metrics['speaker_embedding_consistency']:.4f}")
+                        print(f"  Best Validation Loss: {self.best_val_loss:.4f}")
+                        print(f"{'='*60}")
                     
                     # Save best model
                     if val_loss < self.best_val_loss:
+                        print(f"\n✨ New best model found! Saving...")
                         self.best_val_loss = val_loss
                         self.best_val_metrics = val_metrics
                         self.save_checkpoint(model, optimizer, scheduler, global_step, epoch, "best")
+                        if self.accelerator.is_main_process:
+                            print(f"✅ Best model saved at step {global_step}")
                 
                 # Save checkpoint
                 if global_step % self.config.save_steps == 0:
+                    print(f"\n💾 Saving checkpoint at step {global_step}...")
                     self.save_checkpoint(model, optimizer, scheduler, global_step, epoch, "checkpoint")
+                    if self.accelerator.is_main_process:
+                        print(f"✅ Checkpoint saved at step {global_step}")
+            
+            # Close progress bar for this epoch
+            pbar.close()
             
             # End of epoch evaluation
             if eval_dataloader:
+                print(f"\n{'='*60}")
+                print(f"🔍 End of Epoch {epoch + 1} Validation")
+                print(f"{'='*60}")
                 val_loss, val_metrics = self.evaluate(model, eval_dataloader, global_step, epoch)
                 
+                if self.accelerator.is_main_process:
+                    print(f"\n{'='*60}")
+                    print(f"📈 Epoch {epoch + 1} Validation Results")
+                    print(f"{'='*60}")
+                    print(f"  Validation Loss: {val_loss:.4f}")
+                    print(f"  Validation Perplexity: {val_metrics['perplexity']:.4f}")
+                    print(f"  Speaker Embedding Consistency: {val_metrics['speaker_embedding_consistency']:.4f}")
+                    print(f"  Best Validation Loss: {self.best_val_loss:.4f}")
+                    print(f"{'='*60}")
+                
                 if val_loss < self.best_val_loss:
+                    print(f"\n✨ New best model found at end of epoch {epoch + 1}! Saving...")
                     self.best_val_loss = val_loss
                     self.best_val_metrics = val_metrics
                     self.save_checkpoint(model, optimizer, scheduler, global_step, epoch, "best")
+                    if self.accelerator.is_main_process:
+                        print(f"✅ Best model saved at end of epoch {epoch + 1}")
         
         # Save last checkpoint
         self.save_checkpoint(model, optimizer, scheduler, global_step, epoch, "last")
@@ -531,35 +670,58 @@ class Trainer:
     
     def training_step(self, model, batch):
         """Perform one training step."""
-        input_ids = batch['input_ids']
-        codec_ids = batch['codec_ids']
-        ref_mels = batch['ref_mels']
-        text_embedding_mask = batch['text_embedding_mask']
-        codec_embedding_mask = batch['codec_embedding_mask']
-        attention_mask = batch['attention_mask']
-        codec_0_labels = batch['codec_0_labels']
-        codec_mask = batch['codec_mask']
+        # Move all tensors to the model's device (accelerator will handle dtype)
+        device = model.model.device
+        
+        input_ids = batch['input_ids'].to(device)
+        codec_ids = batch['codec_ids'].to(device)
+        ref_mels = batch['ref_mels'].to(device)
+        text_embedding_mask = batch['text_embedding_mask'].to(device)
+        codec_embedding_mask = batch['codec_embedding_mask'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        codec_0_labels = batch['codec_0_labels'].to(device)
+        codec_mask = batch['codec_mask'].to(device)
         
         # Get speaker embedding
-        speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype))
+        speaker_embedding = model.model.speaker_encoder(ref_mels)
         if self.target_speaker_embedding is None:
             self.target_speaker_embedding = speaker_embedding.detach()
         
         input_text_ids = input_ids[:, :, 0]
         input_codec_ids = input_ids[:, :, 1]
         
-        input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
-        input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+        # Let accelerator handle dtype conversion automatically
+        input_text_embedding = model.model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+        input_codec_embedding = model.model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
         input_codec_embedding[:, 6, :] = speaker_embedding
         
         input_embeddings = input_text_embedding + input_codec_embedding
         
         for i in range(1, 16):
-            codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+            codec_i_embedding = model.model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
             codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
             input_embeddings = input_embeddings + codec_i_embedding
+
+        # logger.info(f"Input embeddings shape: {input_embeddings.shape}")
+        # logger.info(f"Input embeddings: {input_embeddings}")
+        # logger.info(f"Attention mask shape: {attention_mask.shape}")
+        # logger.info(f"Attention mask: {attention_mask}")
+        # logger.info(f"Codec 0 labels shape: {codec_0_labels.shape}")
+        # logger.info(f"Codec 0 labels: {codec_0_labels}")
+        # logger.info(f"Codec mask shape: {codec_mask.shape}")
+        # logger.info(f"Codec mask: {codec_mask}")
+        # logger.info(f"Speaker embedding shape: {speaker_embedding.shape}")
+
+        # logger.info(f"Input text embedding data type: {input_text_embedding.dtype}")
+        # logger.info(f"Input codec embedding data type: {input_codec_embedding.dtype}")
+        # logger.info(f"Speaker embedding data type: {speaker_embedding.dtype}")
+
+        # logger.info(f"Input embeddings data type: {input_embeddings.dtype}")
+        # logger.info(f"Attention mask data type: {attention_mask.dtype}")
+        # logger.info(f"Codec 0 labels data type: {codec_0_labels.dtype}")
+        # logger.info(f"Codec mask data type: {codec_mask.dtype}")
         
-        outputs = model.talker(
+        outputs = model.model.talker(
             inputs_embeds=input_embeddings[:, :-1, :],
             attention_mask=attention_mask[:, :-1],
             labels=codec_0_labels[:, 1:],
@@ -570,7 +732,7 @@ class Trainer:
         talker_hidden_states = hidden_states[codec_mask[:, 1:]]
         talker_codec_ids = codec_ids[codec_mask]
         
-        sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+        sub_talker_logits, sub_talker_loss = model.model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
         
         loss = outputs.loss + self.config.sub_talker_loss_weight * sub_talker_loss
         
@@ -579,7 +741,7 @@ class Trainer:
     def evaluate(self, model, eval_dataloader, step, epoch):
         """Evaluate model on validation set."""
         print(f"\nEvaluating at step {step}...")
-        model.eval()
+        model.model.eval()
         
         total_loss = 0
         total_samples = 0
@@ -592,8 +754,8 @@ class Trainer:
                 total_samples += batch['input_ids'].size(0)
                 
                 # Collect speaker embeddings for similarity calculation
-                ref_mels = batch['ref_mels']
-                speaker_emb = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype))
+                ref_mels = batch['ref_mels'].to(model.model.device)
+                speaker_emb = model.model.speaker_encoder(ref_mels)
                 speaker_embeddings.append(speaker_emb.cpu())
         
         avg_loss = total_loss / total_samples
@@ -638,22 +800,63 @@ class Trainer:
             print(f"Validation Perplexity: {metrics['perplexity']:.4f}")
             print(f"Speaker Embedding Consistency: {metrics['speaker_embedding_consistency']:.4f}")
         
-        model.train()
+        model.model.train()
         return avg_loss, metrics
     
+    def _upload_checkpoint_to_hf(self, checkpoint_dir: str, repo_id: str, checkpoint_type: str):
+        """Upload a checkpoint directory to HuggingFace."""
+        if not self.config.upload_to_hf or not self.config.hf_token:
+            return
+
+        if not self.accelerator.is_main_process:
+            return
+
+        if not os.path.exists(checkpoint_dir):
+            print(f"⚠ Checkpoint directory {checkpoint_dir} does not exist, skipping upload")
+            return
+
+        try:
+            print(f"\n{'='*60}")
+            print(f"📤 Uploading {checkpoint_type} checkpoint to HuggingFace")
+            print(f"{'='*60}")
+            print(f"  Repository: {repo_id}")
+            print(f"  Local path: {checkpoint_dir}")
+            print(f"{'='*60}")
+
+            login(token=self.config.hf_token)
+            api = HfApi()
+
+            api.upload_folder(
+                folder_path=checkpoint_dir,
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=f"Upload {checkpoint_type} checkpoint - Step {self.best_val_loss if checkpoint_type == 'best' else 'last'}, Speaker: {self.config.speaker_name}"
+            )
+
+            print(f"✓ Successfully uploaded {checkpoint_type} checkpoint to {repo_id}")
+            print(f"{'='*60}\n")
+        except Exception as e:
+            print(f"⚠ Error uploading {checkpoint_type} checkpoint to HuggingFace: {e}")
+            print(f"{'='*60}\n")
+
     def save_checkpoint(self, model, optimizer, scheduler, step, epoch, checkpoint_type):
         """Save model checkpoint."""
         if not self.accelerator.is_main_process:
             return
         
+        print(f"\n{'='*60}")
+        print(f"💾 Saving {checkpoint_type.upper()} Checkpoint")
+        print(f"{'='*60}")
+        print(f"  Step: {step}")
+        print(f"  Epoch: {epoch + 1}/{self.config.num_epochs}")
+        print(f"  Type: {checkpoint_type}")
+        print(f"{'='*60}")
+        
         output_dir = os.path.join(self.config.output_dir, checkpoint_type)
         os.makedirs(output_dir, exist_ok=True)
         
-        # Unwrap model
-        unwrapped_model = self.accelerator.unwrap_model(model)
-        
-        # Save model weights
-        state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
+        # Save model weights (access the underlying model directly)
+        state_dict = {k: v.detach().to("cpu") for k, v in model.model.state_dict().items()}
         
         # Count the number of layer weights being saved
         layer_keys = [k for k in state_dict.keys() if 'talker.model.layers' in k]
@@ -663,7 +866,7 @@ class Trainer:
             if 'layers' in parts:
                 layer_idx = parts[parts.index('layers') + 1]
                 unique_layers.add(layer_idx)
-        print(f"Saving {len(unique_layers)} layers in checkpoint")
+        print(f"  Saving {len(unique_layers)} layers in checkpoint")
         
         # Add speaker embedding
         if self.target_speaker_embedding is not None:
@@ -676,7 +879,7 @@ class Trainer:
         print(f"✓ Saved model.safetensors")
         
         # Save configuration
-        config_dict = unwrapped_model.config.to_dict()
+        config_dict = model.model.config.to_dict()
         config_dict["tts_model_type"] = "custom_voice"
         talker_config = config_dict.get("talker_config", {})
         talker_config["spk_id"] = {self.config.speaker_name: 3000}
@@ -685,7 +888,7 @@ class Trainer:
         
         # Verify the layer count in the saved configuration
         saved_num_layers = config_dict["talker_config"]["num_hidden_layers"]
-        actual_num_layers = len(unwrapped_model.talker.model.layers)
+        actual_num_layers = len(model.model.talker.model.layers)
         print(f"Saving checkpoint with {saved_num_layers} layers (actual: {actual_num_layers})")
         if saved_num_layers != actual_num_layers:
             print(f"⚠ Warning: Configuration layer count ({saved_num_layers}) doesn't match actual layers ({actual_num_layers})")
@@ -697,26 +900,28 @@ class Trainer:
         print(f"✓ Saved config.json")
         
         # Save generation_config.json if available
-        if hasattr(unwrapped_model, 'generate_config') and unwrapped_model.generate_config is not None:
+        if hasattr(model.model, 'generate_config') and model.model.generate_config is not None:
             generation_config_file = os.path.join(output_dir, "generation_config.json")
             with open(generation_config_file, 'w', encoding='utf-8') as f:
-                json.dump(unwrapped_model.generate_config, f, indent=2, ensure_ascii=False)
+                json.dump(model.model.generate_config, f, indent=2, ensure_ascii=False)
             print(f"✓ Saved generation_config.json")
         
         # Save processor config from the loaded model (includes tokenizer files)
-        if unwrapped_model.processor is not None:
-            unwrapped_model.processor.save_pretrained(output_dir)
+        if hasattr(model.model, 'processor') and model.model.processor is not None:
+            model.model.processor.save_pretrained(output_dir)
             print(f"✓ Saved processor and tokenizer files")
         
         # Save speech tokenizer separately
-        if hasattr(unwrapped_model, 'speech_tokenizer') and unwrapped_model.speech_tokenizer is not None:
+        if hasattr(model.model, 'speech_tokenizer') and model.model.speech_tokenizer is not None:
             speech_tokenizer_dir = os.path.join(output_dir, "speech_tokenizer")
             os.makedirs(speech_tokenizer_dir, exist_ok=True)
-            unwrapped_model.speech_tokenizer.save_pretrained(speech_tokenizer_dir)
+            # The speech_tokenizer is a wrapper, save its underlying model and feature_extractor
+            model.model.speech_tokenizer.model.save_pretrained(speech_tokenizer_dir)
+            model.model.speech_tokenizer.feature_extractor.save_pretrained(speech_tokenizer_dir)
             print(f"✓ Saved speech_tokenizer to {speech_tokenizer_dir}")
         
         # Save speaker encoder for the new speaker (optional, for reference)
-        if hasattr(unwrapped_model, 'speaker_encoder') and unwrapped_model.speaker_encoder is not None:
+        if hasattr(model.model, 'speaker_encoder') and model.model.speaker_encoder is not None:
             speaker_encoder_dir = os.path.join(output_dir, "speaker_encoder")
             os.makedirs(speaker_encoder_dir, exist_ok=True)
             # Save speaker encoder config
@@ -833,8 +1038,17 @@ Speaker encoder weights are included in the checkpoint and have been fine-tuned.
         with open(readme_file, 'w', encoding='utf-8') as f:
             f.write(readme_content)
         print(f"✓ Created README.md with usage instructions")
-        
+
         print(f"✓ Saved {checkpoint_type} checkpoint to {output_dir}")
+
+        # Upload to HuggingFace if configured
+        if checkpoint_type in ["best", "last"]:
+            if checkpoint_type == "best":
+                repo_id = self.config.hf_best_model_repo
+            else:
+                repo_id = self.config.hf_last_model_repo
+
+            self._upload_checkpoint_to_hf(output_dir, repo_id, checkpoint_type)
     
     def upload_to_huggingface(self):
         """Upload models to HuggingFace."""
