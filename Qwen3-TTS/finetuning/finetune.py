@@ -1218,6 +1218,11 @@ def main():
     config_obj = AutoConfig.from_pretrained(config.init_model_path)
     train_dataloader = data_processor.get_train_dataloader(model, config_obj)
     eval_dataloader = data_processor.get_eval_dataloader(model, config_obj)
+
+    # Load ref audio/mel for each train speaker (required when batch has "speakers")
+    speakers_list = [s.strip() for s in config.train_speakers.split(",") if s.strip()]
+    if speakers_list:
+        load_speaker_refs(speakers_list)
     
     # Step 4: Train
     trainer.train(model, train_dataloader, eval_dataloader)
