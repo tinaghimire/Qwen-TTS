@@ -3,59 +3,13 @@
 """
 Unified Training Script for Qwen3-TTS Fine-tuning.
 
-Main Workflow:
-1. Load/prepare dataset
-2. Load models
-3. Login to WandB
-4. Fine-tune with parameters
+Data flow (only supported path):
+1. Upload data once: python data_processing.py prepare --speaker both --upload --repo_id "vaghawan/qwen3-tts-multi-speaker"
+2. Training loads from HuggingFace (vaghawan/qwen3-tts-multi-speaker) by subset/split.
+   ref_audio comes from voices/ (hausa_speaker.wav, english_speaker.wav); audio_codes from tokenizer on the fly.
+3. Combined train/val dataloaders via get_multispeaker_finetune_dataloader (batch- and CUDA-friendly).
 
-Features:
-- Supports multiple data modes (jsonl, direct, none)
-- Uses 25Hz tokenizer
-- Layer replacement and addition
-- Training loss logging to training_log.jsonl
-- Validation loss and metrics logging to validation_log.jsonl
-- WandB tracking
-- Best and last model checkpointing
-- Multi-GPU support via HuggingFace Accelerate
-
-Multi-GPU Training:
-This script supports distributed training across multiple GPUs using Accelerate.
-
-Single GPU Training:
-    python train.py
-
-Multi-GPU Training (4 GPUs):
-    accelerate launch --num_processes=4 train.py
-
-    Or with explicit GPU selection:
-    CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --num_processes=4 train.py
-
-Multi-GPU Configuration Recommendations:
-For 4x GPUs with large datasets (600k+ samples), set in .env:
-    DATA_MODE=direct                        # Required for large datasets
-    BATCH_SIZE=8                            # Per GPU (32 total effective batch)
-    LEARNING_RATE=1e-3                      # Scaled for multi-GPU
-    NUM_EPOCHS=3
-    GRADIENT_ACCUMULATION_STEPS=1           # No accumulation with 4 GPUs
-    WARMUP_STEPS=1000                       # Increased warmup for larger batch
-    MIXED_PRECISION=bf16                    # Critical for multi-GPU efficiency
-
-Data Mode Selection:
-    - JSONL mode (DATA_MODE=jsonl):
-        * Best for: Small to medium datasets (<100k samples)
-        * Loads all data into RAM at once
-        * Fast data loading but memory intensive
-        * NOT recommended for >100k samples (will cause OOM)
-
-    - Direct mode (DATA_MODE=direct):
-        * Best for: Large datasets (>100k samples) or multi-GPU training
-        * Streams data from HuggingFace Hub
-        * Uses minimal RAM regardless of dataset size
-        * REQUIRED for 600k+ samples to avoid memory issues
-        * Dataset must be available on HuggingFace Hub
-
-For more details on multi-GPU training, see the README.md documentation.
+Multi-GPU: accelerate launch --num_processes=N train.py
 """
 
 import json
@@ -93,9 +47,61 @@ from qwen_tts import Qwen3TTSTokenizer
 from safetensors.torch import save_file
 from finetuning.dataset import TTSDataset
 from finetuning.layer_utils import replace_and_add_layers, print_model_summary, get_trainable_params
+from finetuning.dual_loss_trainer import DualLossTrainer
+from finetuning.quality_metrics import EVALUATION_METRICS, QualityMetricsCalculator
+from transformers import AutoProcessor
+from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
 
 # Load environment variables
 load_dotenv(override=True)
+
+# Global ref_audio and ref_mel per speaker (loaded once, used for all batches)
+REF_AUDIO_CACHE = {}
+REF_MEL_CACHE = {}
+
+
+def _voices_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "voices")
+
+
+def load_speaker_refs(speakers: List[str], voices_dir: Optional[str] = None) -> None:
+    """Load ref_audio and ref_mel for each speaker into REF_AUDIO_CACHE and REF_MEL_CACHE."""
+    import librosa
+    voices_dir = voices_dir or _voices_dir()
+    for speaker in speakers:
+        if speaker in REF_MEL_CACHE:
+            continue
+        path = os.path.join(voices_dir, f"{speaker}.wav")
+        if not os.path.exists(path):
+            logger.warning(f"Ref audio not found: {path}, skipping speaker {speaker}")
+            continue
+        audio, sr = librosa.load(path, sr=None, mono=True)
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=-1)
+        audio = audio.astype(np.float32)
+        if sr != 24000:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=24000)
+        REF_AUDIO_CACHE[speaker] = audio
+        with torch.inference_mode():
+            ref_mel = mel_spectrogram(
+                torch.from_numpy(audio).unsqueeze(0),
+                n_fft=1024, num_mels=128, sampling_rate=24000,
+                hop_size=256, win_size=1024, fmin=0, fmax=12000,
+            ).transpose(1, 2)
+        REF_MEL_CACHE[speaker] = ref_mel
+    logger.info(f"Loaded ref_audio/ref_mel for speakers: {list(REF_MEL_CACHE.keys())}")
+
+
+def ref_mels_for_speakers(speakers: List[str], device: torch.device) -> torch.Tensor:
+    """Build (B, T, 128) ref_mels tensor from list of speaker ids using REF_MEL_CACHE."""
+    ref_list = [REF_MEL_CACHE[s] for s in speakers]
+    max_t = max(m.shape[1] for m in ref_list)
+    padded = []
+    for m in ref_list:
+        if m.shape[1] < max_t:
+            m = torch.nn.functional.pad(m, (0, 0, 0, max_t - m.shape[1]))
+        padded.append(m)
+    return torch.cat(padded, dim=0).to(device)
 
 
 @dataclass
@@ -103,16 +109,11 @@ class TrainingConfig:
     """Training configuration loaded from .env file."""
     
     
-    # Data Configuration - Mode for loading data
-    
-    data_mode: str = os.getenv("DATA_MODE", "jsonl")  # Options: jsonl (use prepared JSONL files), direct (load from HuggingFace), none (skip preparation)
-    dataset_name: str = os.getenv("DATASET_NAME", "vaghawan/hausa-tts-22k")  # HuggingFace dataset name (used for direct mode)
-    train_jsonl: str = os.getenv("TRAIN_JSONL", "./data/train.jsonl")  # Path to training JSONL file (used for jsonl mode)
-    validation_jsonl: str = os.getenv("VALIDATION_JSONL", "./data/validation.jsonl")  # Path to validation JSONL file (optional)
-    
-    
+    # Data: HuggingFace combined multi-speaker only
+    hf_dataset_repo: str = os.getenv("HF_DATASET_REPO", "vaghawan/qwen3-tts-multi-speaker")
+    train_speakers: str = os.getenv("TRAIN_SPEAKERS", "hausa_speaker,english_speaker")
+
     # Model Configuration - Paths to models and tokenizer
-    
     init_model_path: str = os.getenv("INIT_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")  # Base model path (12Hz or 25Hz model)
     tokenizer_path: str = os.getenv("TOKENIZER_PATH", "Qwen/Qwen3-TTS-Tokenizer-12Hz")  # Tokenizer path (12Hz or 25Hz)
     output_dir: str = os.getenv("OUTPUT_DIR", "./output")  # Directory for checkpoints and logs
@@ -127,7 +128,15 @@ class TrainingConfig:
     warmup_steps: int = int(os.getenv("WARMUP_STEPS", 200))  # Number of warmup steps for learning rate schedule
     max_grad_norm: float = float(os.getenv("MAX_GRAD_NORM", 1.0))  # Maximum gradient norm for clipping
     sub_talker_loss_weight: float = float(os.getenv("SUB_TALKER_LOSS_WEIGHT", 0.3))  # Weight for auxiliary sub-talker loss
-    
+
+    # Auxiliary losses (reconstruction, voice consistency, prosody)
+    use_auxiliary_losses: bool = os.getenv("USE_AUXILIARY_LOSSES", "true").lower() == "true"
+    mel_reconstruction_weight: float = float(os.getenv("MEL_RECONSTRUCTION_WEIGHT", 0.2))
+    reconstruction_weight: float = float(os.getenv("RECONSTRUCTION_WEIGHT", 0.15))
+    voice_consistency_weight: float = float(os.getenv("VOICE_CONSISTENCY_WEIGHT", 0.2))
+    prosody_weight: float = float(os.getenv("PROSODY_WEIGHT", 0.15))
+    audio_loss_every_n_steps: int = int(os.getenv("AUDIO_LOSS_EVERY_N_STEPS", "4"))
+
     # Layer Replacement Configuration - How many layers to replace/add
     replace_last_n_layers: int = int(os.getenv("REPLACE_LAST_N_LAYERS", 2))  # Number of last layers to replace with new ones
     add_new_layers: int = int(os.getenv("ADD_NEW_LAYERS", 4))  # Number of additional layers to add after replacement
@@ -156,7 +165,6 @@ class TrainingConfig:
     hf_best_model_repo: str = os.getenv("HF_BEST_MODEL_REPO", "your-username/tts-best")  # Repo for best model (lowest val loss)
     hf_last_model_repo: str = os.getenv("HF_LAST_MODEL_REPO", "your-username/tts-last")  # Repo for last checkpoint
     
-    
     # Device and Precision - Training device setup
     
     device: str = os.getenv("DEVICE", "cuda")  # Device: cuda (GPU) or cpu
@@ -166,7 +174,8 @@ class TrainingConfig:
     # Data Limits - Max samples to use for testing
     
     max_train_samples: Optional[int] = int(os.getenv("MAX_TRAIN_SAMPLES")) if os.getenv("MAX_TRAIN_SAMPLES") else None  # Max training samples (for debugging)
-    max_eval_samples: Optional[int] = int(os.getenv("MAX_EVAL_SAMPLES")) if os.getenv("MAX_EVAL_SAMPLES") else None  # Max validation samples (for debugging)
+    max_eval_samples: Optional[int] = int(os.getenv("MAX_VAL_SAMPLES")) if os.getenv("MAX_EVAL_SAMPLES") else None  # Max validation samples (for debugging)
+    cache_dir: str = os.getenv("CACHE_DIR", "./cache")  # Cache directory for streaming mode
     
     
     # Reference Audio - Reference audio for speaker cloning
@@ -218,148 +227,60 @@ class Logger:
 
 class DataProcessor:
     """Handle data loading and preparation."""
-    
+
     def __init__(self, config: TrainingConfig):
         self.config = config
+        self.train_preprocessor = None
+        self.eval_preprocessor = None
     
     def prepare_data(self):
-        """Prepare data based on mode."""
+        """Data is loaded from HuggingFace in get_train_dataloader / get_eval_dataloader."""
         print("="*60)
         print("Step 1: Data Preparation")
         print("="*60)
-        print(f"Data mode: {self.config.data_mode}")
-        
-        if self.config.data_mode == "none":
-            print("Skipping data preparation (DATA_MODE=none)")
-            return
-        
-        elif self.config.data_mode == "jsonl":
-            # Check if JSONL files exist
-            train_exists = os.path.exists(self.config.train_jsonl)
-            val_exists = self.config.validation_jsonl and os.path.exists(self.config.validation_jsonl)
-            
-            if train_exists and (val_exists or not self.config.validation_jsonl):
-                print(f"✓ Local JSONL files already exist:")
-                print(f"  Train: {self.config.train_jsonl}")
-                if val_exists:
-                    print(f"  Validation: {self.config.validation_jsonl}")
-                print("Skipping data preparation")
-                return
-            
-            # Prepare data from HuggingFace to JSONL
-            print(f"Preparing data from HuggingFace to JSONL...")
-            print(f"Dataset: {self.config.dataset_name}")
-            
-            from data_processing import JSONLDataPreparer
-            
-            preparer = JSONLDataPreparer(
-                dataset_name=self.config.dataset_name,
-                output_dir=os.path.dirname(self.config.train_jsonl),
-                tokenizer_path=self.config.tokenizer_path,
-                device=self.config.device,
-            )
-            
-            # Prepare train split
-            preparer.prepare_split("train", max_samples=self.config.max_train_samples)
-            
-            # Prepare validation split if needed
-            if self.config.validation_jsonl:
-                preparer.prepare_split("validation", max_samples=self.config.max_eval_samples)
-            
-            print("Data preparation complete!")
-        
-        elif self.config.data_mode == "direct":
-            print(f"Using direct HuggingFace loading mode")
-            print(f"Dataset: {self.config.dataset_name}")
-            print(f"Data will be loaded on-the-fly during training")
-            print("No data preparation needed")
-        
-        else:
-            raise ValueError(f"Invalid DATA_MODE: {self.config.data_mode}")
+        print("Loading from HuggingFace (combined multi-speaker)")
+        print(f"   Repo: {self.config.hf_dataset_repo}")
+        print(f"   Speakers: {self.config.train_speakers}")
+        print("="*60)
     
     def get_train_dataloader(self, model, config) -> DataLoader:
-        """Get training dataloader based on mode."""
-        if self.config.data_mode == "jsonl":
-            # Load from JSONL
-            train_data = []
-            with open(self.config.train_jsonl, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:  # Skip empty lines
-                        train_data.append(json.loads(line))
-            
-            if self.config.max_train_samples:
-                train_data = train_data[:self.config.max_train_samples]
-            
-            dataset = TTSDataset(train_data, model.processor, config)
-            return DataLoader(
-                dataset,
-                batch_size=self.config.batch_size,
-                shuffle=True,
-                collate_fn=dataset.collate_fn,
-                num_workers=4,  # Parallel data loading
-                pin_memory=True,  # Faster GPU transfer
-                prefetch_factor=2  # Prefetch batches
-            )
-        
-        elif self.config.data_mode == "direct":
-            # Load directly from HuggingFace
-            from data_processing import HFDirectDataLoader
-            
-            dataset = HFDirectDataLoader(
-                dataset_name=self.config.dataset_name,
-                split="train",
-                tokenizer_path=self.config.tokenizer_path,
-                max_samples=self.config.max_train_samples,
-                audio_sr_device=self.config.device,
-            )
-            return DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True)
-        
-        else:
-            raise ValueError(f"Invalid DATA_MODE: {self.config.data_mode}")
+        """Get training dataloader from HuggingFace (combined multi-speaker)."""
+        from finetuning.data_processing import get_multispeaker_finetune_dataloader
+        speakers = [s.strip() for s in self.config.train_speakers.split(",") if s.strip()]
+        if not speakers:
+            speakers = ["hausa_speaker", "english_speaker"]
+        return get_multispeaker_finetune_dataloader(
+            repo_id=self.config.hf_dataset_repo,
+            speakers=speakers,
+            split="train",
+            processor=model.processor,
+            config=config,
+            batch_size=self.config.batch_size,
+            max_samples=self.config.max_train_samples,
+            tokenizer_path=self.config.tokenizer_path,
+            cache_dir=self.config.cache_dir,
+            num_workers=None,
+        )
     
     def get_eval_dataloader(self, model, config) -> Optional[DataLoader]:
-        """Get evaluation dataloader based on mode."""
-        if not self.config.validation_jsonl:
-            return None
-        
-        if self.config.data_mode == "jsonl":
-            # Load from JSONL
-            val_data = []
-            with open(self.config.validation_jsonl, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:  # Skip empty lines
-                        val_data.append(json.loads(line))
-            
-            if self.config.max_eval_samples:
-                val_data = val_data[:self.config.max_eval_samples]
-            
-            dataset = TTSDataset(val_data, model.processor, config)
-            return DataLoader(
-                dataset,
-                batch_size=self.config.batch_size,
-                shuffle=False,
-                collate_fn=dataset.collate_fn,
-                num_workers=2,  # Fewer workers for eval
-                pin_memory=True,  # Faster GPU transfer
-                prefetch_factor=2  # Prefetch batches
-            )
-        
-        elif self.config.data_mode == "direct":
-            # Load directly from HuggingFace
-            from data_processing import HFDirectDataLoader
-            
-            dataset = HFDirectDataLoader(
-                dataset_name=self.config.dataset_name,
-                split="validation",
-                tokenizer_path=self.config.tokenizer_path,
-                max_samples=self.config.max_eval_samples,
-                audio_sr_device=self.config.device,
-            )
-            return DataLoader(dataset, batch_size=self.config.batch_size, shuffle=False)
-        else:
-            return None
+        """Get validation dataloader from HuggingFace (combined multi-speaker)."""
+        from finetuning.data_processing import get_multispeaker_finetune_dataloader
+        speakers = [s.strip() for s in self.config.train_speakers.split(",") if s.strip()]
+        if not speakers:
+            speakers = ["hausa_speaker", "english_speaker"]
+        return get_multispeaker_finetune_dataloader(
+            repo_id=self.config.hf_dataset_repo,
+            speakers=speakers,
+            split="validation",
+            processor=model.processor,
+            config=config,
+            batch_size=self.config.batch_size,
+            max_samples=self.config.max_eval_samples,
+            tokenizer_path=self.config.tokenizer_path,
+            cache_dir=self.config.cache_dir,
+            shuffle=False,
+            num_workers=None,
+        )
 
 
 class Trainer:
@@ -371,6 +292,8 @@ class Trainer:
         self.target_speaker_embedding = None
         self.best_val_loss = float('inf')
         self.best_val_metrics = {}
+        self.dual_loss_trainer = None
+        self._last_aux = None
         
         # Initialize accelerator
         self.accelerator = Accelerator(
@@ -450,6 +373,12 @@ class Trainer:
                 verbose=True
             )
             print_model_summary(model.model)
+        
+        if self.config.use_auxiliary_losses:
+            config_obj = AutoConfig.from_pretrained(self.config.init_model_path)
+            self.dual_loss_trainer = DualLossTrainer(model, config_obj)
+            model.model.mel_head = self.dual_loss_trainer.mel_head
+            logger.info("✓ Auxiliary losses enabled (mel reconstruction, voice consistency, prosody)")
         
         return model
     
@@ -542,7 +471,7 @@ class Trainer:
             
             for step, batch in enumerate(pbar):
                 with self.accelerator.accumulate(model):
-                    loss = self.training_step(model, batch)
+                    loss = self.training_step(model, batch, global_step=global_step)
                     
                     # Backward pass
                     self.accelerator.backward(loss)
@@ -570,14 +499,18 @@ class Trainer:
                 
                 # Log to WandB at every step for clear graph visualization
                 if self.config.use_wandb:
-                    self.accelerator.log({
+                    log_dict = {
                         "train/loss": loss.item(),
                         "train/learning_rate": current_lr,
                         "train/epoch": epoch,
                         "train/global_step": global_step,
                         "train/progress_pct": progress_pct,
                         "train/epoch_progress": epoch_progress
-                    }, step=global_step)
+                    }
+                    if getattr(self, "_last_aux", None) is not None:
+                        for k, v in self._last_aux.items():
+                            log_dict[f"train/aux_{k}"] = v
+                    self.accelerator.log(log_dict, step=global_step)
                 
                 # Log to file and print progress at configured intervals
                 if global_step % self.config.logging_steps == 0:
@@ -612,8 +545,10 @@ class Trainer:
                         print(f"📈 Validation Results - Step {global_step}")
                         print(f"{'='*60}")
                         print(f"  Validation Loss: {val_loss:.4f}")
-                        print(f"  Validation Perplexity: {val_metrics['perplexity']:.4f}")
-                        print(f"  Speaker Embedding Consistency: {val_metrics['speaker_embedding_consistency']:.4f}")
+                        for k in EVALUATION_METRICS:
+                            v = val_metrics.get(k)
+                            if v is not None:
+                                print(f"  {k}: {v:.4f}" if np.isfinite(v) else f"  {k}: N/A")
                         print(f"  Best Validation Loss: {self.best_val_loss:.4f}")
                         print(f"{'='*60}")
                     
@@ -648,8 +583,10 @@ class Trainer:
                     print(f"📈 Epoch {epoch + 1} Validation Results")
                     print(f"{'='*60}")
                     print(f"  Validation Loss: {val_loss:.4f}")
-                    print(f"  Validation Perplexity: {val_metrics['perplexity']:.4f}")
-                    print(f"  Speaker Embedding Consistency: {val_metrics['speaker_embedding_consistency']:.4f}")
+                    for k in EVALUATION_METRICS:
+                        v = val_metrics.get(k)
+                        if v is not None:
+                            print(f"  {k}: {v:.4f}" if np.isfinite(v) else f"  {k}: N/A")
                     print(f"  Best Validation Loss: {self.best_val_loss:.4f}")
                     print(f"{'='*60}")
                 
@@ -668,14 +605,17 @@ class Trainer:
         print("Training complete!")
         print("="*60)
     
-    def training_step(self, model, batch):
+    def training_step(self, model, batch, global_step=None):
         """Perform one training step."""
         # Move all tensors to the model's device (accelerator will handle dtype)
         device = model.model.device
-        
+        if "speakers" in batch:
+            ref_mels = ref_mels_for_speakers(batch["speakers"], device)
+            batch = {**batch, "ref_mels": ref_mels}
+        else:
+            ref_mels = batch["ref_mels"].to(device)
         input_ids = batch['input_ids'].to(device)
         codec_ids = batch['codec_ids'].to(device)
-        ref_mels = batch['ref_mels'].to(device)
         text_embedding_mask = batch['text_embedding_mask'].to(device)
         codec_embedding_mask = batch['codec_embedding_mask'].to(device)
         attention_mask = batch['attention_mask'].to(device)
@@ -685,7 +625,7 @@ class Trainer:
         # Get speaker embedding
         speaker_embedding = model.model.speaker_encoder(ref_mels)
         if self.target_speaker_embedding is None:
-            self.target_speaker_embedding = speaker_embedding.detach()
+            self.target_speaker_embedding = speaker_embedding.clone().detach() # Create a new tensor with the same data and detach it from the computational graph
         
         input_text_ids = input_ids[:, :, 0]
         input_codec_ids = input_ids[:, :, 1]
@@ -735,74 +675,224 @@ class Trainer:
         sub_talker_logits, sub_talker_loss = model.model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
         
         loss = outputs.loss + self.config.sub_talker_loss_weight * sub_talker_loss
-        
+
+        if self.config.use_auxiliary_losses and self.dual_loss_trainer is not None and "target_mel" in batch and "target_audio" in batch:
+            # Every audio_loss_every_n_steps, generate waveforms and include waveform/voice/prosody losses
+            generated_audio_tensor = None
+            if global_step is not None and self.config.audio_loss_every_n_steps > 0 and global_step % self.config.audio_loss_every_n_steps == 0:
+                with torch.no_grad():
+                    gen_list = self._generate_audio_from_batch(model, batch)
+                if gen_list is not None:
+                    generated_audio_tensor = self._pad_wav_list_to_tensor(gen_list, device)
+
+            aux = self.dual_loss_trainer.compute_auxiliary_losses(
+                batch=batch,
+                model=model,
+                outputs=outputs,
+                sample_rate=24000,
+                generated_audio=generated_audio_tensor,
+            )
+            loss = loss + self.config.mel_reconstruction_weight * aux["mel_reconstruction_loss"]
+            if self.config.reconstruction_weight and aux["waveform_reconstruction_loss"].item() != 0:
+                loss = loss + self.config.reconstruction_weight * aux["waveform_reconstruction_loss"]
+            if self.config.voice_consistency_weight and aux["voice_consistency_loss"].item() != 0:
+                loss = loss + self.config.voice_consistency_weight * aux["voice_consistency_loss"]
+            if self.config.prosody_weight and aux["prosody_loss"].item() != 0:
+                loss = loss + self.config.prosody_weight * aux["prosody_loss"]
+
+            self._last_aux = {k: v.item() for k, v in aux.items() if torch.is_tensor(v)}
+        else:
+            self._last_aux = None
         return loss
-    
+
+    def _generate_audio_from_batch(self, model, batch):
+        """Generate waveform from one batch using predicted codec_0 and teacher-forced codec 1..15.
+        Returns list of numpy arrays (one per sample) or None on failure.
+        """
+        device = model.model.device
+        input_ids = batch["input_ids"].to(device)
+        codec_ids = batch["codec_ids"].to(device)
+        ref_mels = batch["ref_mels"].to(device)
+        codec_mask = batch["codec_mask"].to(device)
+        codec_0_labels = batch["codec_0_labels"].to(device)
+        text_embedding_mask = batch["text_embedding_mask"].to(device)
+        codec_embedding_mask = batch["codec_embedding_mask"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+
+        speaker_embedding = model.model.speaker_encoder(ref_mels)
+        input_text_ids = input_ids[:, :, 0]
+        input_codec_ids = input_ids[:, :, 1]
+        input_text_embedding = model.model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+        input_codec_embedding = model.model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+        input_codec_embedding[:, 6, :] = speaker_embedding
+        input_embeddings = input_text_embedding + input_codec_embedding
+        for i in range(1, 16):
+            codec_i_embedding = model.model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+            codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
+            input_embeddings = input_embeddings + codec_i_embedding
+
+        outputs = model.model.talker(
+            inputs_embeds=input_embeddings[:, :-1, :],
+            attention_mask=attention_mask[:, :-1],
+            labels=codec_0_labels[:, 1:],
+            output_hidden_states=False,
+        )
+        logits = outputs.logits
+        if logits is None:
+            return None
+        pred_next = logits.argmax(dim=-1)
+        pred_codec_0_full = torch.cat([codec_0_labels[:, 0:1], pred_next], dim=1)
+
+        B = codec_ids.shape[0]
+        codes_list = []
+        for i in range(B):
+            indices = codec_mask[i].nonzero(as_tuple=True)[0]
+            if len(indices) == 0:
+                codes_list.append(None)
+                continue
+            codes_i = codec_ids[i, indices].clone()
+            codes_i[:, 0] = pred_codec_0_full[i, indices]
+            codes_list.append(codes_i.cpu())
+
+        valid_codes = [c for c in codes_list if c is not None and c.shape[0] > 0]
+        valid_indices = [i for i in range(B) if codes_list[i] is not None and codes_list[i].shape[0] > 0]
+        if not valid_codes:
+            return None
+        if not hasattr(model.model, "speech_tokenizer") or model.model.speech_tokenizer is None:
+            return None
+        try:
+            wavs, sr = model.model.speech_tokenizer.decode([{"audio_codes": c} for c in valid_codes])
+        except Exception:
+            return None
+        out = [None] * B
+        for j, i in enumerate(valid_indices):
+            if j < len(wavs):
+                w = wavs[j]
+                out[i] = w if isinstance(w, np.ndarray) else np.array(w, dtype=np.float32)
+        return out
+
+    def _pad_wav_list_to_tensor(self, wav_list, device):
+        """Convert list of variable-length numpy wavs (or None) to padded tensor [B, max_len] on device."""
+        if not wav_list:
+            return None
+        valid = [i for i, w in enumerate(wav_list) if w is not None and len(w) > 0]
+        if not valid:
+            return None
+        max_len = max(len(wav_list[i]) for i in valid)
+        B = len(wav_list)
+        out = np.zeros((B, max_len), dtype=np.float32)
+        for i in range(B):
+            if wav_list[i] is not None and len(wav_list[i]) > 0:
+                L = len(wav_list[i])
+                w = np.asarray(wav_list[i], dtype=np.float32).flatten()
+                out[i, :L] = w[:L]
+        return torch.from_numpy(out).to(device)
+
     def evaluate(self, model, eval_dataloader, step, epoch):
-        """Evaluate model on validation set."""
+        """Evaluate model on validation set. Reports EVALUATION_METRICS."""
         print(f"\nEvaluating at step {step}...")
         model.model.eval()
-        
+
         total_loss = 0
         total_samples = 0
         speaker_embeddings = []
-        
+        sample_batch_for_quality = None  # one batch with target_audio for quality_metrics
+
         with torch.no_grad():
             for batch in tqdm(eval_dataloader, desc="Evaluating"):
                 loss = self.training_step(model, batch)
-                total_loss += loss.item() * batch['input_ids'].size(0)
-                total_samples += batch['input_ids'].size(0)
-                
-                # Collect speaker embeddings for similarity calculation
-                ref_mels = batch['ref_mels'].to(model.model.device)
+                total_loss += loss.item() * batch["input_ids"].size(0)
+                total_samples += batch["input_ids"].size(0)
+
+                if "speakers" in batch:
+                    ref_mels = ref_mels_for_speakers(batch["speakers"], model.model.device)
+                else:
+                    ref_mels = batch["ref_mels"].to(model.model.device)
                 speaker_emb = model.model.speaker_encoder(ref_mels)
                 speaker_embeddings.append(speaker_emb.cpu())
-        
+
+                if sample_batch_for_quality is None and "target_audio" in batch and "target_audio_lengths" in batch:
+                    sample_batch_for_quality = batch
+
         avg_loss = total_loss / total_samples
-        
-        # Calculate speaker embedding consistency (similarity within batch)
+
+        # Speaker embedding consistency (similarity within batch)
         if len(speaker_embeddings) > 1:
             all_embeddings = torch.cat(speaker_embeddings, dim=0)
-            # Calculate cosine similarity matrix
             embeddings_norm = torch.nn.functional.normalize(all_embeddings, p=2, dim=-1)
             similarity_matrix = torch.mm(embeddings_norm, embeddings_norm.t())
-            # Get upper triangle (excluding diagonal)
             upper_tri = similarity_matrix.triu(diagonal=1)
             avg_similarity = upper_tri.mean().item()
         else:
-            avg_similarity = 1.0  # Only one batch, perfect consistency
-        
-        # Calculate metrics
+            avg_similarity = 1.0
+
+        # Build metrics with all five EVALUATION_METRICS
         metrics = {
+            "perplexity": torch.exp(torch.tensor(avg_loss)).item() if avg_loss < 20 else float("inf"),
             "speaker_embedding_consistency": avg_similarity,
-            "perplexity": torch.exp(torch.tensor(avg_loss)).item() if avg_loss < 20 else float('inf'),
+            "pronunciation_accuracy": 0.0,
+            "tonal_accuracy": 0.0,
+            "prosody_accuracy": 0.0,
         }
-        
+
+        # When we have target audio, generate audio from the model and compute all five
+        # metrics with QualityMetricsCalculator(generated_audio, target_audio).
+        if sample_batch_for_quality is not None and self.accelerator.is_main_process:
+            try:
+                with torch.no_grad():
+                    gen_wavs = self._generate_audio_from_batch(model, sample_batch_for_quality)
+                if gen_wavs is not None:
+                    qcalc = QualityMetricsCalculator(sample_rate=24000)
+                    target_audio = sample_batch_for_quality["target_audio"]
+                    target_audio_lengths = sample_batch_for_quality["target_audio_lengths"]
+                    B = min(len(gen_wavs), target_audio.shape[0])
+                    scores = {k: [] for k in EVALUATION_METRICS}
+                    for i in range(B):
+                        L = int(target_audio_lengths[i].item())
+                        if L < 100 or i >= len(gen_wavs) or gen_wavs[i] is None or len(gen_wavs[i]) < 100:
+                            continue
+                        ref_np = target_audio[i, :L].float().cpu().numpy()
+                        gen_np = gen_wavs[i] if isinstance(gen_wavs[i], np.ndarray) else np.array(gen_wavs[i], dtype=np.float32)
+                        # Trim or pad gen to similar length for metric (quality_metrics pads internally)
+                        m = qcalc.calculate_all_metrics(gen_np, ref_np)
+                        for k in EVALUATION_METRICS:
+                            scores[k].append(m[k])
+                    for k in EVALUATION_METRICS:
+                        if scores[k]:
+                            metrics[k] = float(np.mean(scores[k]))
+            except Exception as e:
+                logger.warning("Quality metrics (generated vs target_audio) failed: %s", e)
+
         # Log validation
         self.logger.log_validation(
             step=step,
             epoch=epoch,
             loss=avg_loss,
-            metrics=metrics
+            metrics=metrics,
         )
-        
+
         if self.config.use_wandb:
-            self.accelerator.log({
+            log_dict = {
                 "val/loss": avg_loss,
-                "val/perplexity": metrics["perplexity"],
-                "val/speaker_embedding_consistency": metrics["speaker_embedding_consistency"],
                 "val/step": step,
-                "val/epoch": epoch
-            }, step=step)
-        
+                "val/epoch": epoch,
+            }
+            for k in EVALUATION_METRICS:
+                log_dict[f"val/{k}"] = metrics[k]
+            self.accelerator.log(log_dict, step=step)
+
         if self.accelerator.is_main_process:
             print(f"Validation Loss: {avg_loss:.4f}")
-            print(f"Validation Perplexity: {metrics['perplexity']:.4f}")
-            print(f"Speaker Embedding Consistency: {metrics['speaker_embedding_consistency']:.4f}")
-        
+            for k in EVALUATION_METRICS:
+                v = metrics[k]
+                if isinstance(v, float) and not np.isfinite(v):
+                    print(f"  {k}: N/A")
+                else:
+                    print(f"  {k}: {v:.4f}")
+
         model.model.train()
         return avg_loss, metrics
-    
+
     def _upload_checkpoint_to_hf(self, checkpoint_dir: str, repo_id: str, checkpoint_type: str):
         """Upload a checkpoint directory to HuggingFace."""
         if not self.config.upload_to_hf or not self.config.hf_token:
@@ -1089,6 +1179,18 @@ Speaker encoder weights are included in the checkpoint and have been fine-tuned.
             )
             print(f"✓ Uploaded last model to {self.config.hf_last_model_repo}")
 
+    def cleanup(self):
+        """Cleanup background preprocessors."""
+        print("\nCleaning up background preprocessors...")
+        
+        if self.train_preprocessor:
+            self.train_preprocessor.stop()
+        
+        if self.eval_preprocessor:
+            self.eval_preprocessor.stop()
+        
+        print("✓ Cleanup complete")
+
 
 def main():
     """Main training function."""
@@ -1119,10 +1221,11 @@ def main():
     
     # Step 4: Train
     trainer.train(model, train_dataloader, eval_dataloader)
-    
+
     # Step 5: Upload to HuggingFace
     trainer.upload_to_huggingface()
-    
+    trainer.cleanup()
+
     # Finish WandB
     if config.use_wandb:
         trainer.accelerator.end_training()

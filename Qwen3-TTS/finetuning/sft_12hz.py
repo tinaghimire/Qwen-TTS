@@ -143,7 +143,7 @@ def train():
 
                 speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype))
                 if target_speaker_embedding is None:
-                    target_speaker_embedding = speaker_embedding.detach()
+                    target_speaker_embedding = speaker_embedding.clone().detach() # Create a new tensor with the same data and detach it from the computational graph
 
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
@@ -249,7 +249,7 @@ def train():
                 accelerator.print(f"✓ Saved speaker encoder config for speaker: {args.speaker_name}")
 
             unwrapped_model = accelerator.unwrap_model(model)
-            state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
+            state_dict = {k: v.clone().detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
 
             # Count the number of layer weights being saved
             layer_keys = [k for k in state_dict.keys() if 'talker.model.layers' in k]
@@ -263,7 +263,7 @@ def train():
             accelerator.print(f"Saving {len(unique_layers)} layers in checkpoint")
 
             weight = state_dict['talker.model.codec_embedding.weight']
-            state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
+            state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].clone().detach().to(weight.device).to(weight.dtype)
             save_path = os.path.join(output_dir, "model.safetensors")
             save_file(state_dict, save_path)
             accelerator.print(f"✓ Saved model.safetensors")
