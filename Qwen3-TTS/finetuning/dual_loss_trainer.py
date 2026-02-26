@@ -126,45 +126,48 @@ class ReconstructionLoss(nn.Module):
         ref_audio: torch.Tensor,
         sample_rate: int
     ) -> torch.Tensor:
-        """Calculate mel-spectrogram reconstruction loss."""
+        """Calculate mel-spectrogram reconstruction loss (batch on GPU when possible)."""
         try:
-            import librosa
-        except ImportError:
-            # Fallback to simple FFT-based loss
-            return self._fft_loss(gen_audio, ref_audio)
-
-        # Process batch
+            from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram as gpu_mel
+            # Batch GPU mel: (B, T) -> (B, mel_dim, time); same params as data pipeline
+            gen_mel = gpu_mel(
+                gen_audio,
+                n_fft=1024, num_mels=self.n_mels, sampling_rate=sample_rate,
+                hop_size=256, win_size=1024, fmin=0, fmax=12000,
+            ).transpose(1, 2)
+            ref_mel = gpu_mel(
+                ref_audio,
+                n_fft=1024, num_mels=self.n_mels, sampling_rate=sample_rate,
+                hop_size=256, win_size=1024, fmin=0, fmax=12000,
+            ).transpose(1, 2)
+            min_len = min(gen_mel.shape[-1], ref_mel.shape[-1])
+            gen_mel = gen_mel[..., :min_len]
+            ref_mel = ref_mel[..., :min_len]
+            return F.l1_loss(gen_mel, ref_mel)
+        except Exception:
+            pass
+        # Fallback: CPU librosa per-sample (avoids blocking when GPU mel unavailable)
+        import librosa
         gen_mels = []
         ref_mels = []
-
+        gen_np = gen_audio.cpu().numpy()
+        ref_np = ref_audio.cpu().numpy()
         for i in range(gen_audio.shape[0]):
-            gen_np = gen_audio[i].cpu().numpy()
-            ref_np = ref_audio[i].cpu().numpy()
-
-            # Extract mel spectrograms
             gen_mel = librosa.feature.melspectrogram(
-                y=gen_np, sr=sample_rate, n_mels=self.n_mels
+                y=gen_np[i], sr=sample_rate, n_mels=self.n_mels
             )
             ref_mel = librosa.feature.melspectrogram(
-                y=ref_np, sr=sample_rate, n_mels=self.n_mels
+                y=ref_np[i], sr=sample_rate, n_mels=self.n_mels
             )
-
-            # Convert to log scale
             gen_mel_db = librosa.power_to_db(gen_mel, ref=np.max)
             ref_mel_db = librosa.power_to_db(ref_mel, ref=np.max)
-
             gen_mels.append(torch.from_numpy(gen_mel_db).to(gen_audio.device))
             ref_mels.append(torch.from_numpy(ref_mel_db).to(gen_audio.device))
-
-        # Stack and calculate loss
         gen_mel_tensor = torch.stack(gen_mels)
         ref_mel_tensor = torch.stack(ref_mels)
-
-        # Pad to match lengths
         min_len = min(gen_mel_tensor.shape[-1], ref_mel_tensor.shape[-1])
         gen_mel_tensor = gen_mel_tensor[..., :min_len]
         ref_mel_tensor = ref_mel_tensor[..., :min_len]
-
         return F.l1_loss(gen_mel_tensor, ref_mel_tensor)
 
     def _fft_loss(
@@ -384,19 +387,18 @@ class ProsodyLoss(nn.Module):
         ref_audio: torch.Tensor,
         sample_rate: int
     ) -> torch.Tensor:
-        """Calculate pause pattern matching loss (MSE between pause distributions)."""
+        """Calculate pause pattern matching loss (single GPU->CPU sync for full batch)."""
         import librosa
-
         device = gen_audio.device
+        gen_np = gen_audio.detach().cpu().numpy()
+        ref_np = ref_audio.detach().cpu().numpy()
         gen_dists = []
         ref_dists = []
         for i in range(gen_audio.shape[0]):
-            gen_np = gen_audio[i].detach().cpu().numpy()
-            ref_np = ref_audio[i].detach().cpu().numpy()
-            gen_pauses = self._detect_pauses(gen_np, sample_rate)
-            ref_pauses = self._detect_pauses(ref_np, sample_rate)
-            num_frames_gen = (len(gen_np) - 512) // 256 + 1
-            num_frames_ref = (len(ref_np) - 512) // 256 + 1
+            gen_pauses = self._detect_pauses(gen_np[i], sample_rate)
+            ref_pauses = self._detect_pauses(ref_np[i], sample_rate)
+            num_frames_gen = (len(gen_np[i]) - 512) // 256 + 1
+            num_frames_ref = (len(ref_np[i]) - 512) // 256 + 1
             gen_pause_dist = self._pause_to_distribution(gen_pauses, max(num_frames_gen, 1), device)
             ref_pause_dist = self._pause_to_distribution(ref_pauses, max(num_frames_ref, 1), device)
             gen_dists.append(gen_pause_dist)
@@ -411,42 +413,29 @@ class ProsodyLoss(nn.Module):
         ref_audio: torch.Tensor,
         sample_rate: int
     ) -> torch.Tensor:
-        """Calculate pitch contour matching loss."""
+        """Calculate pitch contour matching loss (single GPU->CPU sync for full batch)."""
         import librosa
-
         device = gen_audio.device
-
+        gen_np = gen_audio.cpu().numpy()
+        ref_np = ref_audio.cpu().numpy()
         gen_pitch_list = []
         ref_pitch_list = []
-
         for i in range(gen_audio.shape[0]):
-            gen_np = gen_audio[i].cpu().numpy()
-            ref_np = ref_audio[i].cpu().numpy()
-
-            gen_pitch, gen_mag = librosa.piptrack(y=gen_np, sr=sample_rate)
-            ref_pitch, ref_mag = librosa.piptrack(y=ref_np, sr=sample_rate)
-
-            # Pitch contour: pitch value at bin with max magnitude per frame
+            gen_pitch, gen_mag = librosa.piptrack(y=gen_np[i], sr=sample_rate)
+            ref_pitch, ref_mag = librosa.piptrack(y=ref_np[i], sr=sample_rate)
             gen_idx = gen_mag.argmax(axis=0)
             ref_idx = ref_mag.argmax(axis=0)
             gen_contour = np.array([gen_pitch[gen_idx[t], t] for t in range(gen_pitch.shape[1])], dtype=np.float32)
             ref_contour = np.array([ref_pitch[ref_idx[t], t] for t in range(ref_pitch.shape[1])], dtype=np.float32)
-
             gen_pitch_list.append(torch.from_numpy(gen_contour).float().to(device))
             ref_pitch_list.append(torch.from_numpy(ref_contour).float().to(device))
-
         gen_pitch_tensor = torch.stack(gen_pitch_list)
         ref_pitch_tensor = torch.stack(ref_pitch_list)
-
-        # Align lengths
         min_len = min(gen_pitch_tensor.shape[-1], ref_pitch_tensor.shape[-1])
         gen_pitch_tensor = gen_pitch_tensor[..., :min_len]
         ref_pitch_tensor = ref_pitch_tensor[..., :min_len]
-
-        # Normalize
         gen_norm = (gen_pitch_tensor - gen_pitch_tensor.mean()) / (gen_pitch_tensor.std() + 1e-8)
         ref_norm = (ref_pitch_tensor - ref_pitch_tensor.mean()) / (ref_pitch_tensor.std() + 1e-8)
-
         return F.mse_loss(gen_norm, ref_norm)
 
     def _energy_pattern_loss(
@@ -454,43 +443,32 @@ class ProsodyLoss(nn.Module):
         gen_audio: torch.Tensor,
         ref_audio: torch.Tensor
     ) -> torch.Tensor:
-        """Calculate energy pattern matching loss."""
-        # RMS energy
+        """Calculate energy pattern matching loss (single GPU->CPU sync for full batch)."""
         frame_length = 512
         hop_length = 256
-
+        device = gen_audio.device
+        gen_np = gen_audio.cpu().numpy()
+        ref_np = ref_audio.cpu().numpy()
         gen_energy_list = []
         ref_energy_list = []
-
         for i in range(gen_audio.shape[0]):
-            gen_np = gen_audio[i].cpu().numpy()
-            ref_np = ref_audio[i].cpu().numpy()
-
             gen_energy = torch.tensor(
-                [np.sqrt(np.mean(gen_np[j:j+frame_length]**2))
-                 for j in range(0, len(gen_np)-frame_length, hop_length)]
-            ).float().to(gen_audio.device)
-
+                [np.sqrt(np.mean(gen_np[i, j:j+frame_length]**2))
+                 for j in range(0, len(gen_np[i]) - frame_length, hop_length)]
+            ).float().to(device)
             ref_energy = torch.tensor(
-                [np.sqrt(np.mean(ref_np[j:j+frame_length]**2))
-                 for j in range(0, len(ref_np)-frame_length, hop_length)]
-            ).float().to(gen_audio.device)
-
+                [np.sqrt(np.mean(ref_np[i, j:j+frame_length]**2))
+                 for j in range(0, len(ref_np[i]) - frame_length, hop_length)]
+            ).float().to(device)
             gen_energy_list.append(gen_energy)
             ref_energy_list.append(ref_energy)
-
         gen_energy_tensor = torch.stack(gen_energy_list)
         ref_energy_tensor = torch.stack(ref_energy_list)
-
-        # Align lengths
         min_len = min(gen_energy_tensor.shape[-1], ref_energy_tensor.shape[-1])
         gen_energy_tensor = gen_energy_tensor[..., :min_len]
         ref_energy_tensor = ref_energy_tensor[..., :min_len]
-
-        # Normalize
         gen_norm = gen_energy_tensor / (gen_energy_tensor.mean() + 1e-8)
         ref_norm = ref_energy_tensor / (ref_energy_tensor.mean() + 1e-8)
-
         return F.mse_loss(gen_norm, ref_norm)
 
     def _detect_pauses(
@@ -702,7 +680,7 @@ class DualLossTrainer:
         return total_loss, loss_components
 
     def compute_mel_reconstruction_loss(self, hidden_states: torch.Tensor, codec_mask: torch.Tensor, target_mel: torch.Tensor, seq_len_offset: int = 1) -> torch.Tensor:
-        """Differentiable mel reconstruction loss (pronunciation / phoneme focus)."""
+        """Differentiable mel reconstruction loss (batched on GPU: single mel_head forward, single L1)."""
         device = hidden_states.device
         codec_mask_shifted = codec_mask[:, seq_len_offset:].bool()
         if hidden_states.shape[1] < codec_mask_shifted.shape[1]:
@@ -710,33 +688,51 @@ class DualLossTrainer:
         elif hidden_states.shape[1] > codec_mask_shifted.shape[1]:
             codec_mask_shifted = F.pad(codec_mask_shifted, (0, hidden_states.shape[1] - codec_mask_shifted.shape[1]), value=False)
         B = hidden_states.shape[0]
-        losses = []
+        T_mel = target_mel.shape[1]
+        if T_mel == 0:
+            return torch.tensor(0.0, device=device)
+        # Flatten masked hidden states for one batched mel_head forward
+        h_flat = hidden_states[codec_mask_shifted]
+        if h_flat.shape[0] == 0:
+            return torch.tensor(0.0, device=device)
+        pred_mel_flat = self.mel_head(h_flat)
+        # Build target_mel_flat: for each sample interpolate target_mel[i] to n_codec_i
+        n_codec_per = codec_mask_shifted.sum(dim=1)
+        target_pieces = []
         for i in range(B):
-            n_codec = codec_mask_shifted[i].sum().item()
+            n_codec = n_codec_per[i].item()
             if n_codec == 0:
-                continue
-            h = hidden_states[i][codec_mask_shifted[i]]
-            pred_mel = self.mel_head(h)
-            T_mel = target_mel.shape[1]
-            if T_mel == 0:
                 continue
             target_i = target_mel[i : i + 1].transpose(1, 2)
             target_i = F.interpolate(target_i, size=n_codec, mode="linear", align_corners=False)
-            target_i = target_i.transpose(1, 2).squeeze(0)
-            losses.append(F.l1_loss(pred_mel, target_i))
-        if not losses:
+            target_pieces.append(target_i.squeeze(0).transpose(0, 1))
+        if not target_pieces:
             return torch.tensor(0.0, device=device)
-        return torch.stack(losses).mean()
+        target_mel_flat = torch.cat(target_pieces, dim=0)
+        return F.l1_loss(pred_mel_flat, target_mel_flat)
 
     def compute_auxiliary_losses(self, batch: Dict, model, outputs, sample_rate: int = 24000, generated_audio: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """Compute reconstruction (mel), voice consistency, and prosody losses for train/val."""
+        """Compute reconstruction (mel), voice consistency, and prosody losses for train/val.
+        All returned losses are used in training: they are added (with config weights) to the
+        total loss in finetune.py training_step and backprop runs over the full graph.
+        """
         device = next(model.model.parameters()).device
         ref_mels = batch["ref_mels"].to(device)
         target_mel = batch["target_mel"].to(device)
         target_audio = batch["target_audio"].to(device)
         codec_mask = batch["codec_mask"].to(device)
         loss_dict = {}
-        hidden_states = outputs.hidden_states[-1] if outputs.hidden_states else None
+        # Source of hidden_states: In modeling_qwen3_tts.py, Qwen3TTSTalkerForConditionalGeneration.forward()
+        # returns hidden_states=(outputs.hidden_states, codec_ids), where outputs is from the decoder
+        # (BaseModelOutputWithPast) with hidden_states=all_hidden_states (tuple of per-layer tensors).
+        # So the last decoder layer is outputs.hidden_states[0][-1] (same as finetune.py).
+        hidden_states = None
+        if getattr(outputs, "hidden_states", None) is not None and len(outputs.hidden_states) > 0:
+            first = outputs.hidden_states[0]
+            if isinstance(first, (tuple, list)) and len(first) > 0:
+                hidden_states = first[-1]
+            elif isinstance(first, torch.Tensor):
+                hidden_states = first
         if hidden_states is not None and hasattr(self, "mel_head"):
             loss_dict["mel_reconstruction_loss"] = self.compute_mel_reconstruction_loss(hidden_states, codec_mask, target_mel)
         else:
@@ -746,16 +742,16 @@ class DualLossTrainer:
             ref_emb = model.model.speaker_encoder(ref_mels)
             try:
                 from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
-                gen_mel_list = []
-                for i in range(gen_audio.shape[0]):
-                    g = gen_audio[i].cpu()
-                    if g.dim() == 1:
-                        g = g.unsqueeze(0)
-                    gen_mel_list.append(mel_spectrogram(g, n_fft=1024, num_mels=128, sampling_rate=sample_rate, hop_size=256, win_size=1024, fmin=0, fmax=12000).transpose(1, 2))
-                gen_mel = torch.cat(gen_mel_list, dim=0).to(device)
+                # Batch mel on GPU (single kernel, no per-sample .cpu() sync)
+                gen_mel = mel_spectrogram(
+                    gen_audio,
+                    n_fft=1024, num_mels=128, sampling_rate=sample_rate,
+                    hop_size=256, win_size=1024, fmin=0, fmax=12000,
+                ).transpose(1, 2)
+                gen_emb = model.model.speaker_encoder(gen_mel)
             except Exception:
                 gen_mel = ref_mels
-            gen_emb = model.model.speaker_encoder(gen_mel)
+                gen_emb = ref_emb
             voice_dict = self.voice_consistency_loss(reference_embedding=ref_emb, generated_embedding_1=gen_emb)
             loss_dict["voice_consistency_loss"] = voice_dict["total_voice_loss"]
             recon_dict = self.reconstruction_loss(gen_audio, target_audio, sample_rate=sample_rate)

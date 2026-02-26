@@ -371,6 +371,9 @@ class Qwen3TTSSpeakerEncoder(torch.nn.Module):
         )
 
     def forward(self, hidden_states):
+        # Expect (B, T, C) or (B, 1, T, C); Conv1d requires 3D (B, C, T) after transpose.
+        if hidden_states.dim() == 4:
+            hidden_states = hidden_states.squeeze(1)
         # Minimize transpose for efficiency
         hidden_states = hidden_states.transpose(1, 2)
 

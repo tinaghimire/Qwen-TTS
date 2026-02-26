@@ -1012,8 +1012,14 @@ class Qwen3TTSTokenizerV2Model(Qwen3TTSTokenizerV2PreTrainedModel):
         audio_lengths = (audio_codes[..., 0] > -1).sum(1) * self.decode_upsample_rate
 
         audio_codes = torch.clamp(audio_codes, min=0)
+        # If decoder is on a different device (e.g. CPU for VRAM savings), move codes to decoder and result back
+        decoder_device = next(self.decoder.parameters()).device
+        input_device = audio_codes.device
+        if decoder_device != input_device:
+            audio_codes = audio_codes.to(decoder_device)
         audio_values = self.decoder.chunked_decode(audio_codes.transpose(1, 2)).squeeze(1)
-
+        if decoder_device != input_device:
+            audio_values = audio_values.to(input_device)
         audio_values = [a[:l] for a, l in zip(audio_values, audio_lengths)]
 
         if not return_dict:
