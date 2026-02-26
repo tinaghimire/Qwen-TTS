@@ -80,7 +80,11 @@ def _resolve_language_codec_id(language: str, talker_config: Any) -> Optional[in
     if not getattr(talker_config, "codec_language_id", None) or not isinstance(talker_config.codec_language_id, dict):
         return None
     lang = (language or "english").strip().lower()
+    # Prefer "hausa" when present in config so hausa_speaker gets correct language conditioning
     if lang == "hausa":
+        codec_lang = talker_config.codec_language_id
+        if "hausa" in codec_lang:
+            return codec_lang["hausa"]
         lang = (os.getenv("LANGUAGE_FOR_HAUSA") or "english").strip().lower()
     return talker_config.codec_language_id.get(lang)
 
@@ -266,6 +270,8 @@ class MultiSpeakerStreamingTTSDataset(TorchDataset):
         self.config = config
         self.lag_num = lag_num
         self.speaker_list = speaker_list or []
+        # Map speaker name -> codec spk_id (3000, 3001, ...) so each speaker gets a distinct embedding at inference
+        self.spk_id_map: Dict[str, int] = {s: 3000 + i for i, s in enumerate(self.speaker_list)} if self.speaker_list else {}
 
     def __len__(self) -> int:
         return len(self.multispeaker_dataset)
@@ -362,20 +368,22 @@ class MultiSpeakerStreamingTTSDataset(TorchDataset):
             language_id = _resolve_language_codec_id(lang, self.config.talker_config)
             tc = self.config.talker_config
             if language_id is not None:
-                # [codec_think_id, codec_think_bos_id, language_id, 0 (speaker slot), codec_think_eos_id]
+                # [codec_think_id, codec_think_bos_id, language_id, spk_id (speaker slot), codec_think_eos_id]
+                spk_id = self.spk_id_map.get(data["speaker"], 3000) if self.spk_id_map else 3000
                 input_ids[i, 3:8, 1] = torch.tensor([
                     tc.codec_think_id,
                     tc.codec_think_bos_id,
                     language_id,
-                    0,
+                    spk_id,
                     tc.codec_think_eos_id,
                 ])
             else:
+                spk_id = self.spk_id_map.get(data["speaker"], 3000) if self.spk_id_map else 3000
                 input_ids[i, 3:8, 1] = torch.tensor([
                     tc.codec_nothink_id,
                     tc.codec_think_bos_id,
                     tc.codec_think_eos_id,
-                    0,
+                    spk_id,
                     tc.codec_pad_id,
                 ])
             input_ids[i, 8 : 8 + text_ids_len - 3, 1] = self.config.talker_config.codec_pad_id

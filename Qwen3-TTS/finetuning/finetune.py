@@ -49,6 +49,7 @@ from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from qwen_tts import Qwen3TTSTokenizer
 from safetensors.torch import save_file
 from finetuning.dataset import TTSDataset
+from finetuning.data_processing import SPEAKER_LANGUAGE
 from finetuning.layer_utils import replace_and_add_layers, print_model_summary, get_trainable_params
 from finetuning.dual_loss_trainer import DualLossTrainer
 from finetuning.quality_metrics import EVALUATION_METRICS, QualityMetricsCalculator
@@ -139,6 +140,35 @@ def _training_summary(config: "TrainingConfig", train_dataloader: Any) -> None:
     print("=" * 60 + "\n")
 
 
+def _ensure_config_has_speaker_languages(config_obj: Any, train_speakers_str: str) -> None:
+    """Ensure talker_config.codec_language_id has entries for each speaker's language (e.g. hausa, english)
+    so training uses correct language conditioning. Adds missing languages using english's token id."""
+    speakers = [s.strip() for s in (train_speakers_str or "").split(",") if s.strip()]
+    if not speakers:
+        return
+    languages = list({SPEAKER_LANGUAGE.get(s, "english").strip().lower() for s in speakers})
+    tc = getattr(config_obj, "talker_config", None)
+    if tc is None:
+        return
+    codec_lang = getattr(tc, "codec_language_id", None) if not isinstance(tc, dict) else tc.get("codec_language_id")
+    if not isinstance(codec_lang, dict):
+        codec_lang = dict(codec_lang) if codec_lang else {}
+    english_id = codec_lang.get("english")
+    if english_id is None and codec_lang:
+        english_id = next(iter(codec_lang.values()), None)
+    updated = False
+    for lang in languages:
+        if lang not in codec_lang and english_id is not None:
+            codec_lang[lang] = english_id
+            updated = True
+    if not updated:
+        return
+    if isinstance(tc, dict):
+        tc["codec_language_id"] = codec_lang
+    else:
+        tc.codec_language_id = codec_lang
+
+
 def load_speaker_refs(speakers: List[str], voices_dir: Optional[str] = None) -> None:
     """Load ref_audio and ref_mel for each speaker into REF_AUDIO_CACHE and REF_MEL_CACHE."""
     import librosa
@@ -206,7 +236,7 @@ def _run_save_checkpoint_io(
     train_speakers_list = [s.strip().lower() for s in trainer.config.train_speakers.split(",") if s.strip()]
     if not train_speakers_list:
         train_speakers_list = [trainer.config.speaker_name.lower()]
-    talker_config["spk_id"] = {name: 3000 for name in train_speakers_list}
+    talker_config["spk_id"] = {name: 3000 + i for i, name in enumerate(train_speakers_list)}
     talker_config["spk_is_dialect"] = {name: False for name in train_speakers_list}
     tc_obj = getattr(model.model.config, "talker_config", None)
     codec_lang = talker_config.get("codec_language_id")
@@ -989,7 +1019,8 @@ class Trainer:
         # Let accelerator handle dtype conversion automatically
         input_text_embedding = model.model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
         input_codec_embedding = model.model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-        input_codec_embedding[:, 6, :] = speaker_embedding
+        # Use talker's codec embedding for speaker (spk_id in input_codec_ids at position 6); do not overwrite
+        # so that each speaker's embedding (3000, 3001, ...) is trained and distinct at inference.
         
         input_embeddings = input_text_embedding + input_codec_embedding
         
@@ -1535,6 +1566,7 @@ def main():
     
     # Step 3: Get dataloaders
     config_obj = AutoConfig.from_pretrained(config.init_model_path)
+    _ensure_config_has_speaker_languages(config_obj, config.train_speakers)
     train_dataloader = data_processor.get_train_dataloader(model, config_obj)
     eval_dataloader = data_processor.get_eval_dataloader(model, config_obj)
 
