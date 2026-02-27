@@ -17,9 +17,11 @@ import os
 import subprocess
 import sys
 import datetime
+import multiprocessing
+import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict, fields
 
 import numpy as np
 import torch
@@ -38,9 +40,10 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)    
 
-# Add paths
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Qwen3-TTS"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Qwen3-TTS", "finetuning"))
+# Add paths: ensure project root is on path so "finetuning" and "qwen_tts" are importable
+_project_root = Path(__file__).resolve().parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from qwen_tts import Qwen3TTSTokenizer
@@ -58,10 +61,82 @@ load_dotenv(override=True)
 # Global ref_audio and ref_mel per speaker (loaded once, used for all batches)
 REF_AUDIO_CACHE = {}
 REF_MEL_CACHE = {}
+# Device cache: (tuple(speaker_names), device_str) -> ref_mels tensor to avoid repeated CPU->GPU transfer
+REF_MEL_DEVICE_CACHE = {}
 
 
 def _voices_dir():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "voices")
+
+
+def _get_speech_tokenizer_codebook_size(speech_tokenizer) -> Optional[int]:
+    """Return the codebook size of the speech tokenizer (12Hz or 25Hz) for clamping predicted codes."""
+    if speech_tokenizer is None:
+        return None
+    inner = getattr(speech_tokenizer, "model", None)
+    if inner is None:
+        return None
+    config = getattr(inner, "config", None)
+    if config is None:
+        return None
+    # 12Hz: decoder_config.codebook_size (default 2048)
+    dec = getattr(config, "decoder_config", None)
+    if dec is not None and hasattr(dec, "codebook_size"):
+        return int(dec.codebook_size)
+    # 25Hz: audio_vq_codebook_size (default 32768)
+    if hasattr(config, "audio_vq_codebook_size"):
+        return int(config.audio_vq_codebook_size)
+    # Fallback for 12Hz when decoder_config is not populated
+    if getattr(config, "model_type", "") == "qwen3_tts_tokenizer_12hz":
+        return 2048
+    return None
+
+
+def _training_summary(config: "TrainingConfig", train_dataloader: Any) -> None:
+    """Print data used and training duration summary at startup."""
+    import math
+    speakers = [s.strip() for s in config.train_speakers.split(",") if s.strip()]
+    if not speakers:
+        speakers = ["hausa_speaker", "english_speaker"]
+    n_gpus = int(os.getenv("WORLD_SIZE", "1"))
+    if n_gpus < 1:
+        n_gpus = 1
+    effective_batch = config.train_batch_size * n_gpus * config.gradient_accumulation_steps
+
+    max_train = config.max_train_samples
+    max_val = config.max_eval_samples
+    try:
+        steps_per_epoch = len(train_dataloader)
+        train_samples_used = steps_per_epoch * config.train_batch_size * n_gpus
+    except TypeError:
+        steps_per_epoch = (
+            math.ceil(max_train / (config.train_batch_size * n_gpus))
+            if (max_train and config.train_batch_size)
+            else None
+        )
+        train_samples_used = max_train if max_train else "full dataset"
+
+    total_steps = (steps_per_epoch * config.num_epochs) if steps_per_epoch else None
+
+    print("\n" + "=" * 60)
+    print("Data used & training duration")
+    print("=" * 60)
+    print(f"  HF dataset:        {config.hf_dataset_repo}")
+    print(f"  Speakers:          {', '.join(speakers)}")
+    print(f"  Train samples:     {train_samples_used} (cap: {max_train or 'none'})")
+    print(f"  Val samples cap:   {max_val or 'none'}")
+    print(f"  Batch size:        {config.train_batch_size} per GPU × {n_gpus} GPU(s) × grad_accum {config.gradient_accumulation_steps} = {effective_batch} effective")
+    if steps_per_epoch is not None:
+        print(f"  Steps per epoch:   {steps_per_epoch}")
+        print(f"  Epochs:            {config.num_epochs}")
+        if total_steps is not None:
+            print(f"  Total steps:       {total_steps}")
+    print()
+    print("  Recommendation:    Train 3–5 epochs for this setup. With 150k train")
+    print("                     samples and batch 128, expect ~1.2k steps/epoch (~6k steps")
+    print("                     for 5 epochs). Monitor validation loss; stop early if")
+    print("                     it plateaus or increases.")
+    print("=" * 60 + "\n")
 
 
 def load_speaker_refs(speakers: List[str], voices_dir: Optional[str] = None) -> None:
@@ -89,19 +164,186 @@ def load_speaker_refs(speakers: List[str], voices_dir: Optional[str] = None) -> 
                 hop_size=256, win_size=1024, fmin=0, fmax=12000,
             ).transpose(1, 2)
         REF_MEL_CACHE[speaker] = ref_mel
-    logger.info(f"Loaded ref_audio/ref_mel for speakers: {list(REF_MEL_CACHE.keys())}")
+    logger.info(f"Loaded ref_audio/ref_mel for speakers: {', '.join(REF_MEL_CACHE)}")
 
 
 def ref_mels_for_speakers(speakers: List[str], device: torch.device) -> torch.Tensor:
-    """Build (B, T, 128) ref_mels tensor from list of speaker ids using REF_MEL_CACHE."""
+    """Build (B, T, 128) ref_mels tensor from list of speaker ids using REF_MEL_CACHE.
+    Caches result per (speakers, device) to avoid repeated CPU->GPU transfer (full GPU/CPU use).
+    """
+    device_str = str(device)
+    key = (tuple(speakers), device_str)
+    if key in REF_MEL_DEVICE_CACHE:
+        return REF_MEL_DEVICE_CACHE[key]
     ref_list = [REF_MEL_CACHE[s] for s in speakers]
     max_t = max(m.shape[1] for m in ref_list)
-    padded = []
-    for m in ref_list:
-        if m.shape[1] < max_t:
-            m = torch.nn.functional.pad(m, (0, 0, 0, max_t - m.shape[1]))
-        padded.append(m)
-    return torch.cat(padded, dim=0).to(device)
+    padded = torch.stack([
+        m if m.shape[1] == max_t else torch.nn.functional.pad(m, (0, 0, 0, max_t - m.shape[1]))
+        for m in ref_list
+    ], dim=0).to(device)
+    REF_MEL_DEVICE_CACHE[key] = padded
+    return padded
+
+
+def _run_save_checkpoint_io(
+    state_dict: Dict[str, torch.Tensor],
+    output_dir: str,
+    model: Any,
+    trainer: Any,
+    checkpoint_type: str,
+    step: int,
+    epoch: int,
+) -> None:
+    """Run checkpoint file I/O in a background thread (batch-compatible, does not block training)."""
+    save_path = os.path.join(output_dir, "model.safetensors")
+    save_file(state_dict, save_path)
+    print(f"✓ Saved model.safetensors")
+    config_dict = model.model.config.to_dict()
+    config_dict["tts_model_type"] = "custom_voice"
+    talker_config = config_dict.get("talker_config", {})
+    if not isinstance(talker_config, dict):
+        talker_config = {}
+    train_speakers_list = [s.strip().lower() for s in trainer.config.train_speakers.split(",") if s.strip()]
+    if not train_speakers_list:
+        train_speakers_list = [trainer.config.speaker_name.lower()]
+    talker_config["spk_id"] = {name: 3000 for name in train_speakers_list}
+    talker_config["spk_is_dialect"] = {name: False for name in train_speakers_list}
+    tc_obj = getattr(model.model.config, "talker_config", None)
+    codec_lang = talker_config.get("codec_language_id")
+    if isinstance(tc_obj, object) and getattr(tc_obj, "codec_language_id", None) and isinstance(tc_obj.codec_language_id, dict):
+        codec_lang = dict(tc_obj.codec_language_id)
+    if not isinstance(codec_lang, dict):
+        codec_lang = {}
+    english_id = codec_lang.get("english")
+    if english_id is None and codec_lang:
+        english_id = next(iter(codec_lang.values()), None)
+    if english_id is not None:
+        if "english" not in codec_lang:
+            codec_lang["english"] = english_id
+        if "hausa" not in codec_lang:
+            codec_lang["hausa"] = english_id
+    talker_config["codec_language_id"] = codec_lang
+    config_dict["talker_config"] = talker_config
+    saved_num_layers = config_dict["talker_config"]["num_hidden_layers"]
+    actual_num_layers = len(model.model.talker.model.layers)
+    if saved_num_layers != actual_num_layers:
+        config_dict["talker_config"]["num_hidden_layers"] = actual_num_layers
+    with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(config_dict, f, indent=2, ensure_ascii=False)
+    print(f"✓ Saved config.json")
+    if hasattr(model.model, "generate_config") and model.model.generate_config is not None:
+        with open(os.path.join(output_dir, "generation_config.json"), "w", encoding="utf-8") as f:
+            json.dump(model.model.generate_config, f, indent=2, ensure_ascii=False)
+        print(f"✓ Saved generation_config.json")
+    _processor = getattr(model, "processor", None) or getattr(model.model, "processor", None)
+    if _processor is not None:
+        _processor.save_pretrained(output_dir)
+        print(f"✓ Saved processor and tokenizer files")
+    if hasattr(model.model, "speech_tokenizer") and model.model.speech_tokenizer is not None:
+        speech_tokenizer_dir = os.path.join(output_dir, "speech_tokenizer")
+        os.makedirs(speech_tokenizer_dir, exist_ok=True)
+        model.model.speech_tokenizer.model.save_pretrained(speech_tokenizer_dir)
+        model.model.speech_tokenizer.feature_extractor.save_pretrained(speech_tokenizer_dir)
+        print(f"✓ Saved speech_tokenizer to {speech_tokenizer_dir}")
+    if hasattr(model.model, "speaker_encoder") and model.model.speaker_encoder is not None:
+        speaker_encoder_dir = os.path.join(output_dir, "speaker_encoder")
+        os.makedirs(speaker_encoder_dir, exist_ok=True)
+        speaker_encoder_config = {
+            "model_type": "qwen3_tts_speaker_encoder",
+            "speaker_name": trainer.config.speaker_name,
+            "speaker_embedding_dim": trainer.target_speaker_embedding.shape[-1] if trainer.target_speaker_embedding is not None else 1024,
+        }
+        with open(os.path.join(speaker_encoder_dir, "speaker_config.json"), "w", encoding="utf-8") as f:
+            json.dump(speaker_encoder_config, f, indent=2, ensure_ascii=False)
+        print(f"✓ Saved speaker encoder config for speaker: {trainer.config.speaker_name}")
+    config_snapshot = asdict(trainer.config)
+    config_snapshot.pop("hf_token", None)
+    training_state = {
+        "step": step,
+        "epoch": epoch,
+        "best_val_loss": trainer.best_val_loss,
+        "best_val_metrics": trainer.best_val_metrics,
+        "config": config_snapshot,
+    }
+    with open(os.path.join(output_dir, "training_state.json"), "w", encoding="utf-8") as f:
+        json.dump(training_state, f, indent=2, ensure_ascii=False)
+    print(f"✓ Saved training_state.json")
+    readme_content = f"""# Fine-Tuned Qwen3-TTS Model Checkpoint
+
+## Model Information
+- **Speaker Name**: {trainer.config.speaker_name}
+- **Base Model**: {trainer.config.init_model_path}
+- **Number of Layers**: {config_dict.get('talker_config', {}).get('num_hidden_layers', 'N/A')}
+- **Hidden Size**: {config_dict.get('talker_config', {}).get('hidden_size', 'N/A')}
+- **Training Epoch**: {epoch}
+- **Training Step**: {step}
+- **Best Validation Loss**: {trainer.best_val_loss:.4f}
+
+## Training Configuration
+- **Learning Rate**: {trainer.config.learning_rate}
+- **Train Batch Size**: {trainer.config.train_batch_size}
+- **Validation Batch Size**: {trainer.config.validation_batch_size}
+- **Gradient Accumulation Steps**: {trainer.config.gradient_accumulation_steps}
+- **Weight Decay**: {trainer.config.weight_decay}
+- **Warmup Steps**: {trainer.config.warmup_steps}
+- **Speaker Encoder Frozen**: {trainer.config.freeze_speaker_encoder}
+- **Layer Replacement**: {trainer.config.replace_last_n_layers} layers replaced, {trainer.config.add_new_layers} layers added
+- **Original Layers Frozen**: {trainer.config.freeze_original_layers}
+
+## Files Included
+- `config.json` - Model configuration
+- `generation_config.json` - Generation parameters
+- `model.safetensors` - Model weights (includes speaker encoder weights)
+- `tokenizer_config.json` - Tokenizer configuration
+- `vocab.json` - Vocabulary file
+- `merges.txt` - BPE merges file
+- `preprocessor_config.json` - Preprocessor configuration
+- `speech_tokenizer/` - Speech tokenizer model and config
+- `speaker_encoder/speaker_config.json` - Speaker encoder configuration
+- `training_state.json` - Training state and configuration
+
+## Loading the Model
+
+```python
+from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+
+# Load the fine-tuned model
+model = Qwen3TTSModel.from_pretrained(
+    "{output_dir}",
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2"
+)
+
+# Generate speech with the new speaker
+text = "Your text here"
+ref_audio = "path/to/reference_audio.wav"
+
+wavs, sr = model.generate_voice_clone(
+    text=text,
+    language="Auto",
+    ref_audio=ref_audio,
+    ref_text="Reference text for ICL mode",
+    x_vector_only_mode=False
+)
+```
+
+## Speaker Information
+The model has been fine-tuned for speaker: **{trainer.config.speaker_name}**
+Speaker embedding is stored at index 3000 in the codec embedding layer.
+Speaker encoder weights are included in the checkpoint and have been fine-tuned.
+
+## Notes
+- This model uses the Qwen3-TTS tokenizer
+- The model supports streaming generation
+- For best results, use reference audio from the same speaker used during training
+- The speaker encoder has been fine-tuned to better capture speaker characteristics
+"""
+    with open(os.path.join(output_dir, "README.md"), "w", encoding="utf-8") as f:
+        f.write(readme_content)
+    print(f"✓ Created README.md with usage instructions")
+    print(f"✓ Saved {checkpoint_type} checkpoint to {output_dir}")
+    if checkpoint_type in ["best", "last"] and getattr(trainer.config, "upload_to_hf", False) and getattr(trainer.config, "hf_token", None):
+        trainer._upload_checkpoint_to_hf(output_dir, trainer.config.hf_best_model_repo if checkpoint_type == "best" else trainer.config.hf_last_model_repo, checkpoint_type)
 
 
 @dataclass
@@ -121,6 +363,8 @@ class TrainingConfig:
     
     # Training Hyperparameters - Learning rate, epochs, etc.
     batch_size: int = int(os.getenv("BATCH_SIZE", 2))  # Batch size for training (depends on GPU memory)
+    train_batch_size: int = int(os.getenv("TRAIN_BATCH_SIZE", os.getenv("BATCH_SIZE", 2)))
+    validation_batch_size: int = int(os.getenv("VALIDATION_BATCH_SIZE", os.getenv("BATCH_SIZE", 2)))
     learning_rate: float = float(os.getenv("LEARNING_RATE", 2e-5))  # Learning rate for optimizer
     num_epochs: int = int(os.getenv("NUM_EPOCHS", 3))  # Number of training epochs
     gradient_accumulation_steps: int = int(os.getenv("GRADIENT_ACCUMULATION_STEPS", 8))  # Gradient accumulation for larger effective batch size
@@ -169,13 +413,27 @@ class TrainingConfig:
     
     device: str = os.getenv("DEVICE", "cuda")  # Device: cuda (GPU) or cpu
     mixed_precision: str = os.getenv("MIXED_PRECISION", "bf16")  # Mixed precision: bf16, fp16, or no
-    
+    # Load model directly onto GPU from the start (max GPU use). e.g. cuda:0 or cuda. Empty = let Accelerator place (default for multi-GPU).
+    model_device_map: Optional[str] = os.getenv("MODEL_DEVICE_MAP") or None
+
+    # Tokenizer and audio codes: CPU (safe with fork) or CUDA (requires spawn for DataLoader workers)
+    use_cpu_for_tokenizer_audio_codes: bool = os.getenv("USE_CPU_FOR_TOKENIZER_AUDIO_CODES", "true").lower() == "true"
+    # Only speech_tokenizer.decoder on CPU (saves VRAM; encoder stays on GPU). Decode() moves data to CPU and back.
+    speech_tokenizer_decoder_on_cpu: bool = os.getenv("SPEECH_TOKENIZER_DECODER_ON_CPU", "true").lower() == "true"
+    # Multiprocessing start method for DataLoader: auto (spawn when using CUDA for tokenizer, else fork), fork, or spawn
+    dataloader_multiprocessing_start_method: str = os.getenv("DATALOADER_MULTIPROCESSING_START_METHOD", "auto").lower()
+    # DataLoader workers and prefetch (faster training: more workers + prefetch + persistent workers)
+    dataloader_num_workers: Optional[int] = int(os.getenv("DATALOADER_NUM_WORKERS")) if os.getenv("DATALOADER_NUM_WORKERS") else None  # None = auto from GPU count
+    dataloader_prefetch_factor: int = int(os.getenv("DATALOADER_PREFETCH_FACTOR", "4"))  # Batches to prefetch per worker (only if num_workers > 0)
+    dataloader_persistent_workers: bool = os.getenv("DATALOADER_PERSISTENT_WORKERS", "true").lower() == "true"  # Keep workers alive between epochs (faster)
     
     # Data Limits - Max samples to use for testing
     
     max_train_samples: Optional[int] = int(os.getenv("MAX_TRAIN_SAMPLES")) if os.getenv("MAX_TRAIN_SAMPLES") else None  # Max training samples (for debugging)
-    max_eval_samples: Optional[int] = int(os.getenv("MAX_VAL_SAMPLES")) if os.getenv("MAX_EVAL_SAMPLES") else None  # Max validation samples (for debugging)
+    max_eval_samples: Optional[int] = int(os.getenv("MAX_VAL_SAMPLES")) if os.getenv("MAX_VAL_SAMPLES") else None  # Max validation samples (for debugging)
     cache_dir: str = os.getenv("CACHE_DIR", "./cache")  # Cache directory for streaming mode
+    use_streaming_dataset: bool = os.getenv("USE_STREAMING_DATASET", "false").lower() == "true"  # Stream from HF (low RAM)
+    shuffle_buffer_size: int = int(os.getenv("SHUFFLE_BUFFER_SIZE", "1000"))  # Buffer size for streaming shuffle
     
     
     # Reference Audio - Reference audio for speaker cloning
@@ -206,16 +464,22 @@ class Logger:
             "epoch_progress": kwargs.get("epoch_progress", 0),
             **{k: v for k, v in kwargs.items() if k not in ["progress_pct", "epoch_progress"]}
         }
+        # Include main_loss, sub_talker_loss, grad_norm when provided
+        for key in ("main_loss", "sub_talker_loss", "grad_norm"):
+            if key in kwargs:
+                log_entry[key] = kwargs[key]
         
         with open(self.training_log_file, 'a') as f:
             f.write(json.dumps(log_entry) + '\n')
     
     def log_validation(self, step: int, epoch: int, loss: float, metrics: Dict[str, float], **kwargs):
-        """Log validation metrics to validation_log.jsonl."""
+        """Log validation metrics to validation_log.jsonl. main_loss and sub_talker_loss at top level for separate charting."""
         log_entry = {
             "step": step,
             "epoch": epoch,
             "loss": loss,
+            "main_loss": metrics.get("main_loss"),
+            "sub_talker_loss": metrics.get("sub_talker_loss"),
             "metrics": metrics,
             "timestamp": datetime.datetime.now().isoformat(),
             **kwargs
@@ -244,7 +508,10 @@ class DataProcessor:
         print("="*60)
     
     def get_train_dataloader(self, model, config) -> DataLoader:
-        """Get training dataloader from HuggingFace (combined multi-speaker)."""
+        """Get training dataloader from HuggingFace (combined multi-speaker).
+        Uses model.processor (Qwen3TTSProcessor from processing_qwen3_tts): text tokenizer + chat template
+        for encoding prompts; same processor is saved in checkpoints so inference can load from checkpoint.
+        """
         from finetuning.data_processing import get_multispeaker_finetune_dataloader
         speakers = [s.strip() for s in self.config.train_speakers.split(",") if s.strip()]
         if not speakers:
@@ -255,15 +522,22 @@ class DataProcessor:
             split="train",
             processor=model.processor,
             config=config,
-            batch_size=self.config.batch_size,
+            batch_size=self.config.train_batch_size,
             max_samples=self.config.max_train_samples,
             tokenizer_path=self.config.tokenizer_path,
+            tokenizer_device="cpu" if self.config.use_cpu_for_tokenizer_audio_codes else "cuda",
             cache_dir=self.config.cache_dir,
-            num_workers=None,
+            num_workers=self.config.dataloader_num_workers,
+            prefetch_factor=self.config.dataloader_prefetch_factor,
+            persistent_workers=self.config.dataloader_persistent_workers,
+            use_streaming=self.config.use_streaming_dataset,
+            shuffle_buffer_size=self.config.shuffle_buffer_size,
         )
     
     def get_eval_dataloader(self, model, config) -> Optional[DataLoader]:
-        """Get validation dataloader from HuggingFace (combined multi-speaker)."""
+        """Get validation dataloader from HuggingFace (combined multi-speaker).
+        Uses model.processor (Qwen3TTSProcessor) same as train.
+        """
         from finetuning.data_processing import get_multispeaker_finetune_dataloader
         speakers = [s.strip() for s in self.config.train_speakers.split(",") if s.strip()]
         if not speakers:
@@ -274,12 +548,17 @@ class DataProcessor:
             split="validation",
             processor=model.processor,
             config=config,
-            batch_size=self.config.batch_size,
+            batch_size=self.config.validation_batch_size,
             max_samples=self.config.max_eval_samples,
             tokenizer_path=self.config.tokenizer_path,
+            tokenizer_device="cpu" if self.config.use_cpu_for_tokenizer_audio_codes else "cuda",
             cache_dir=self.config.cache_dir,
             shuffle=False,
-            num_workers=None,
+            num_workers=self.config.dataloader_num_workers,
+            prefetch_factor=self.config.dataloader_prefetch_factor,
+            persistent_workers=self.config.dataloader_persistent_workers,
+            use_streaming=self.config.use_streaming_dataset,
+            shuffle_buffer_size=self.config.shuffle_buffer_size,
         )
 
 
@@ -294,11 +573,12 @@ class Trainer:
         self.best_val_metrics = {}
         self.dual_loss_trainer = None
         self._last_aux = None
+        self._save_checkpoint_thread = None
         
-        # Initialize accelerator
+        # Initialize accelerator (use bf16/fp16 from config for full GPU throughput)
         self.accelerator = Accelerator(
             gradient_accumulation_steps=config.gradient_accumulation_steps,
-            mixed_precision="no",  # Disable mixed precision - use model's native dtype
+            mixed_precision=config.mixed_precision if config.mixed_precision in ("bf16", "fp16", "no") else "no",
             log_with="wandb" if config.use_wandb else None,
         )
         
@@ -318,11 +598,15 @@ class Trainer:
         print(f"Model path: {self.config.init_model_path}")
         
         # Try to load model with different attention implementations
+        load_kwargs: Dict[str, Any] = {"torch_dtype": torch.float32}
+        if self.config.model_device_map:
+            load_kwargs["device_map"] = self.config.model_device_map
+            print(f"  Model device_map: {self.config.model_device_map} (load on GPU from start)")
         try:
             model = Qwen3TTSModel.from_pretrained(
                 self.config.init_model_path,
-                torch_dtype=torch.float32,
                 attn_implementation="flash_attention_2",
+                **load_kwargs,
             )
             print(f"✓ Model loaded with flash_attention_2")
         except ImportError as e:
@@ -330,8 +614,8 @@ class Trainer:
             print(f"   (You can install flash-attn for potentially faster training)")
             model = Qwen3TTSModel.from_pretrained(
                 self.config.init_model_path,
-                torch_dtype=torch.float32,
                 attn_implementation="sdpa",
+                **load_kwargs,
             )
             print(f"✓ Model loaded with SDPA (Scaled Dot Product Attention)")
         except Exception as e:
@@ -339,8 +623,8 @@ class Trainer:
             print(f"   Trying SDPA fallback...")
             model = Qwen3TTSModel.from_pretrained(
                 self.config.init_model_path,
-                torch_dtype=torch.float32,
                 attn_implementation="sdpa",
+                **load_kwargs,
             )
             print(f"✓ Model loaded with SDPA")
         
@@ -437,7 +721,19 @@ class Trainer:
         # Setup optimizer and scheduler
         optimizer = AdamW(model.model.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
         
-        total_steps = len(train_dataloader) * self.config.num_epochs
+        try:
+            steps_per_epoch = len(train_dataloader)
+        except TypeError:
+            import math
+            n = max(1, getattr(self.accelerator, "num_processes", 1))
+            steps_per_epoch = (
+                math.ceil(self.config.max_train_samples / (self.config.train_batch_size * n))
+                if (self.config.max_train_samples and self.config.train_batch_size)
+                else 10000
+            )
+            print(f"  (streaming/iterable dataset: using steps_per_epoch={steps_per_epoch})")
+        total_steps = steps_per_epoch * self.config.num_epochs
+        
         scheduler = get_cosine_schedule_with_warmup(
             optimizer,
             num_warmup_steps=self.config.warmup_steps,
@@ -449,12 +745,22 @@ class Trainer:
             model, optimizer, train_dataloader, scheduler
         )
         
-        if eval_dataloader:
+        if eval_dataloader is not None:
             eval_dataloader = self.accelerator.prepare(eval_dataloader)
         
         model.model.train()
         global_step = 0
-        total_steps = len(train_dataloader) * self.config.num_epochs
+        try:
+            steps_per_epoch = len(train_dataloader)
+        except TypeError:
+            import math
+            n = max(1, self.accelerator.num_processes)
+            steps_per_epoch = (
+                math.ceil(self.config.max_train_samples / (self.config.train_batch_size * n))
+                if (self.config.max_train_samples and self.config.train_batch_size)
+                else 10000
+            )
+            pass
         
         for epoch in range(self.config.num_epochs):
             print(f"\n{'='*60}")
@@ -471,13 +777,16 @@ class Trainer:
             
             for step, batch in enumerate(pbar):
                 with self.accelerator.accumulate(model):
-                    loss = self.training_step(model, batch, global_step=global_step)
+                    loss, loss_components = self.training_step(model, batch, global_step=global_step)
                     
                     # Backward pass
                     self.accelerator.backward(loss)
                     
+                    grad_norm = None
                     if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(model.model.parameters(), self.config.max_grad_norm)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.model.parameters(), self.config.max_grad_norm)
+                        if grad_norm is not None and not isinstance(grad_norm, float):
+                            grad_norm = grad_norm.item()
                     
                     optimizer.step()
                     scheduler.step()
@@ -487,7 +796,7 @@ class Trainer:
                 
                 # Calculate progress percentage
                 progress_pct = (global_step / total_steps) * 100
-                epoch_progress = ((step + 1) / len(train_dataloader)) * 100
+                epoch_progress = ((step + 1) / steps_per_epoch) * 100
                 
                 # Update progress bar
                 current_lr = scheduler.get_last_lr()[0]
@@ -501,12 +810,17 @@ class Trainer:
                 if self.config.use_wandb:
                     log_dict = {
                         "train/loss": loss.item(),
+                        "train/main_loss": loss_components["main_loss"],
+                        "train/sub_talker_loss": loss_components["sub_talker_loss"],
                         "train/learning_rate": current_lr,
                         "train/epoch": epoch,
                         "train/global_step": global_step,
                         "train/progress_pct": progress_pct,
                         "train/epoch_progress": epoch_progress
                     }
+                    if grad_norm is not None:
+                        log_dict["train/grad_norm"] = grad_norm
+                    # Aux losses: mel is computed every step; waveform/voice/prosody only when step % audio_loss_every_n_steps == 0 (else 0)
                     if getattr(self, "_last_aux", None) is not None:
                         for k, v in self._last_aux.items():
                             log_dict[f"train/aux_{k}"] = v
@@ -520,21 +834,42 @@ class Trainer:
                         loss=loss.item(),
                         learning_rate=current_lr,
                         progress_pct=progress_pct,
-                        epoch_progress=epoch_progress
+                        epoch_progress=epoch_progress,
+                        main_loss=loss_components["main_loss"],
+                        sub_talker_loss=loss_components["sub_talker_loss"],
+                        grad_norm=grad_norm,
                     )
+                    # Mirror same metrics to WandB at logging_steps so file and WandB stay in sync
+                    if self.config.use_wandb:
+                        step_log = {
+                            "train/loss": loss.item(),
+                            "train/main_loss": loss_components["main_loss"],
+                            "train/sub_talker_loss": loss_components["sub_talker_loss"],
+                            "train/learning_rate": current_lr,
+                            "train/progress_pct": progress_pct,
+                            "train/epoch_progress": epoch_progress,
+                        }
+                        if grad_norm is not None:
+                            step_log["train/grad_norm"] = grad_norm
+                        if getattr(self, "_last_aux", None) is not None:
+                            for k, v in self._last_aux.items():
+                                step_log[f"train/aux_{k}"] = v
+                        self.accelerator.log(step_log, step=global_step)
                     
                     if self.accelerator.is_main_process:
                         print(f"\n{'='*60}")
                         print(f"📊 Training Progress - Step {global_step}/{total_steps}")
                         print(f"{'='*60}")
                         print(f"  Overall Progress: {progress_pct:.2f}%")
-                        print(f"  Epoch {epoch + 1} Progress: {epoch_progress:.2f}% ({step + 1}/{len(train_dataloader)} steps)")
-                        print(f"  Loss: {loss.item():.4f}")
+                        print(f"  Epoch {epoch + 1} Progress: {epoch_progress:.2f}% ({step + 1}/{steps_per_epoch} steps)")
+                        print(f"  Loss: {loss.item():.4f} (main: {loss_components['main_loss']:.4f}, sub_talker: {loss_components['sub_talker_loss']:.4f})")
+                        if grad_norm is not None:
+                            print(f"  Grad norm: {grad_norm:.4f}")
                         print(f"  Learning Rate: {current_lr:.10e}")
                         print(f"{'='*60}")
                 
                 # Evaluation
-                if eval_dataloader and global_step % self.config.eval_steps == 0:
+                if eval_dataloader is not None and global_step % self.config.eval_steps == 0:
                     print(f"\n{'='*60}")
                     print(f"🔍 Running Validation at Step {global_step}")
                     print(f"{'='*60}")
@@ -545,6 +880,8 @@ class Trainer:
                         print(f"📈 Validation Results - Step {global_step}")
                         print(f"{'='*60}")
                         print(f"  Validation Loss: {val_loss:.4f}")
+                        print(f"  Main Loss: {val_metrics.get('main_loss', val_loss):.4f}")
+                        print(f"  Sub-talker Loss: {val_metrics.get('sub_talker_loss', 0):.4f}")
                         for k in EVALUATION_METRICS:
                             v = val_metrics.get(k)
                             if v is not None:
@@ -572,7 +909,7 @@ class Trainer:
             pbar.close()
             
             # End of epoch evaluation
-            if eval_dataloader:
+            if eval_dataloader is not None:
                 print(f"\n{'='*60}")
                 print(f"🔍 End of Epoch {epoch + 1} Validation")
                 print(f"{'='*60}")
@@ -583,6 +920,8 @@ class Trainer:
                     print(f"📈 Epoch {epoch + 1} Validation Results")
                     print(f"{'='*60}")
                     print(f"  Validation Loss: {val_loss:.4f}")
+                    print(f"  Main Loss: {val_metrics.get('main_loss', val_loss):.4f}")
+                    print(f"  Sub-talker Loss: {val_metrics.get('sub_talker_loss', 0):.4f}")
                     for k in EVALUATION_METRICS:
                         v = val_metrics.get(k)
                         if v is not None:
@@ -609,7 +948,15 @@ class Trainer:
         """Perform one training step."""
         # Move all tensors to the model's device (accelerator will handle dtype)
         device = model.model.device
-        if "speakers" in batch:
+        if "speaker_ids" in batch:
+            speaker_list = [s.strip() for s in self.config.train_speakers.split(",") if s.strip()]
+            if not speaker_list:
+                speaker_list = ["hausa_speaker", "english_speaker"]
+            ids = batch["speaker_ids"].tolist()
+            speakers = [speaker_list[i] if i < len(speaker_list) else speaker_list[0] for i in ids]
+            ref_mels = ref_mels_for_speakers(speakers, device)
+            batch = {**batch, "ref_mels": ref_mels}
+        elif "speakers" in batch:
             ref_mels = ref_mels_for_speakers(batch["speakers"], device)
             batch = {**batch, "ref_mels": ref_mels}
         else:
@@ -674,16 +1021,38 @@ class Trainer:
         
         sub_talker_logits, sub_talker_loss = model.model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
         
-        loss = outputs.loss + self.config.sub_talker_loss_weight * sub_talker_loss
+        main_loss = outputs.loss
+        loss = main_loss + self.config.sub_talker_loss_weight * sub_talker_loss
+        loss_components = {
+            "main_loss": main_loss.item(),
+            "sub_talker_loss": sub_talker_loss.item(),
+        }
 
         if self.config.use_auxiliary_losses and self.dual_loss_trainer is not None and "target_mel" in batch and "target_audio" in batch:
             # Every audio_loss_every_n_steps, generate waveforms and include waveform/voice/prosody losses
             generated_audio_tensor = None
             if global_step is not None and self.config.audio_loss_every_n_steps > 0 and global_step % self.config.audio_loss_every_n_steps == 0:
-                with torch.no_grad():
-                    gen_list = self._generate_audio_from_batch(model, batch)
-                if gen_list is not None:
-                    generated_audio_tensor = self._pad_wav_list_to_tensor(gen_list, device)
+                was_training = model.model.training
+                try:
+                    if was_training:
+                        model.model.eval()
+                    with torch.no_grad():
+                        gen_list = self._generate_audio_from_batch(model, batch)
+                    if gen_list is not None:
+                        generated_audio_tensor = self._pad_wav_list_to_tensor(gen_list, device)
+                    if generated_audio_tensor is None:
+                        # Fallback: use target_audio so we still compute and backprop waveform/voice/prosody.
+                        # Waveform and prosody will be 0 (target vs target); voice_consistency is ref_emb vs target_mel emb (non-zero).
+                        generated_audio_tensor = batch["target_audio"].to(device)
+                        if self.accelerator.is_main_process:
+                            logger.debug(
+                                f"Step {global_step}: using target_audio as fallback for aux losses (generation failed or skipped)."
+                            )
+                finally:
+                    if was_training:
+                        model.model.train()
+                if gen_list is not None and generated_audio_tensor is None and self.accelerator.is_main_process:
+                    logger.warning(f"Step {global_step}: gen_list had {len(gen_list)} items but _pad_wav_list_to_tensor returned None.")
 
             aux = self.dual_loss_trainer.compute_auxiliary_losses(
                 batch=batch,
@@ -692,18 +1061,17 @@ class Trainer:
                 sample_rate=24000,
                 generated_audio=generated_audio_tensor,
             )
+            # All auxiliary losses are always added (weight * loss) so they are used in backward when non-zero.
             loss = loss + self.config.mel_reconstruction_weight * aux["mel_reconstruction_loss"]
-            if self.config.reconstruction_weight and aux["waveform_reconstruction_loss"].item() != 0:
-                loss = loss + self.config.reconstruction_weight * aux["waveform_reconstruction_loss"]
-            if self.config.voice_consistency_weight and aux["voice_consistency_loss"].item() != 0:
-                loss = loss + self.config.voice_consistency_weight * aux["voice_consistency_loss"]
-            if self.config.prosody_weight and aux["prosody_loss"].item() != 0:
-                loss = loss + self.config.prosody_weight * aux["prosody_loss"]
+            loss = loss + self.config.reconstruction_weight * aux["waveform_reconstruction_loss"]
+            loss = loss + self.config.voice_consistency_weight * aux["voice_consistency_loss"]
+            loss = loss + self.config.prosody_weight * aux["prosody_loss"]
 
             self._last_aux = {k: v.item() for k, v in aux.items() if torch.is_tensor(v)}
+            loss_components.update(self._last_aux)
         else:
             self._last_aux = None
-        return loss
+        return loss, loss_components
 
     def _generate_audio_from_batch(self, model, batch):
         """Generate waveform from one batch using predicted codec_0 and teacher-forced codec 1..15.
@@ -752,17 +1120,33 @@ class Trainer:
                 continue
             codes_i = codec_ids[i, indices].clone()
             codes_i[:, 0] = pred_codec_0_full[i, indices]
-            codes_list.append(codes_i.cpu())
+            codes_list.append(codes_i)
 
-        valid_codes = [c for c in codes_list if c is not None and c.shape[0] > 0]
-        valid_indices = [i for i in range(B) if codes_list[i] is not None and codes_list[i].shape[0] > 0]
+        valid_codes = []
+        valid_indices = []
+        for i in range(B):
+            c = codes_list[i]
+            if c is not None and c.shape[0] > 0:
+                valid_codes.append(c)
+                valid_indices.append(i)
         if not valid_codes:
+            logger.debug("_generate_audio_from_batch: no valid_codes (codec_mask may be empty or indices mismatch)")
             return None
         if not hasattr(model.model, "speech_tokenizer") or model.model.speech_tokenizer is None:
+            logger.warning(
+                "Audio aux losses skipped: model.model.speech_tokenizer is missing. "
+                "Load the base TTS model with speech_tokenizer (e.g. from_pretrained(init_model_path))."
+            )
             return None
+        # Clamp codes to tokenizer codebook range to avoid "index out of range" in decode
+        codebook_size = _get_speech_tokenizer_codebook_size(model.model.speech_tokenizer)
+        if codebook_size is not None:
+            valid_codes = [torch.clamp(c.long(), 0, codebook_size - 1) for c in valid_codes]
+        # Pass codes on same device as tokenizer (decode does .to(self.device)); avoids CPU sync
         try:
             wavs, sr = model.model.speech_tokenizer.decode([{"audio_codes": c} for c in valid_codes])
-        except Exception:
+        except Exception as e:
+            logger.warning(f"speech_tokenizer.decode failed: {e}")
             return None
         out = [None] * B
         for j, i in enumerate(valid_indices):
@@ -775,17 +1159,21 @@ class Trainer:
         """Convert list of variable-length numpy wavs (or None) to padded tensor [B, max_len] on device."""
         if not wav_list:
             return None
-        valid = [i for i, w in enumerate(wav_list) if w is not None and len(w) > 0]
+        valid = []
+        max_len = 0
+        for i, w in enumerate(wav_list):
+            if w is not None and len(w) > 0:
+                valid.append(i)
+                if len(w) > max_len:
+                    max_len = len(w)
         if not valid:
             return None
-        max_len = max(len(wav_list[i]) for i in valid)
         B = len(wav_list)
         out = np.zeros((B, max_len), dtype=np.float32)
-        for i in range(B):
-            if wav_list[i] is not None and len(wav_list[i]) > 0:
-                L = len(wav_list[i])
-                w = np.asarray(wav_list[i], dtype=np.float32).flatten()
-                out[i, :L] = w[:L]
+        for i in valid:
+            w = np.asarray(wav_list[i], dtype=np.float32).flatten()
+            L = len(w)
+            out[i, :L] = w[:L]
         return torch.from_numpy(out).to(device)
 
     def evaluate(self, model, eval_dataloader, step, epoch):
@@ -795,26 +1183,40 @@ class Trainer:
 
         total_loss = 0
         total_samples = 0
+        total_main_loss = 0
+        total_sub_talker_loss = 0
         speaker_embeddings = []
         sample_batch_for_quality = None  # one batch with target_audio for quality_metrics
 
         with torch.no_grad():
             for batch in tqdm(eval_dataloader, desc="Evaluating"):
-                loss = self.training_step(model, batch)
-                total_loss += loss.item() * batch["input_ids"].size(0)
-                total_samples += batch["input_ids"].size(0)
+                loss, loss_components = self.training_step(model, batch)
+                batch_size = batch["input_ids"].size(0)
+                total_loss += loss.item() * batch_size
+                total_main_loss += loss_components["main_loss"] * batch_size
+                total_sub_talker_loss += loss_components["sub_talker_loss"] * batch_size
+                total_samples += batch_size
 
-                if "speakers" in batch:
+                if "speaker_ids" in batch:
+                    speaker_list = [s.strip() for s in self.config.train_speakers.split(",") if s.strip()]
+                    if not speaker_list:
+                        speaker_list = ["hausa_speaker", "english_speaker"]
+                    ids = batch["speaker_ids"].tolist()
+                    speakers = [speaker_list[i] if i < len(speaker_list) else speaker_list[0] for i in ids]
+                    ref_mels = ref_mels_for_speakers(speakers, model.model.device)
+                elif "speakers" in batch:
                     ref_mels = ref_mels_for_speakers(batch["speakers"], model.model.device)
                 else:
                     ref_mels = batch["ref_mels"].to(model.model.device)
                 speaker_emb = model.model.speaker_encoder(ref_mels)
-                speaker_embeddings.append(speaker_emb.cpu())
+                speaker_embeddings.append(speaker_emb)
 
                 if sample_batch_for_quality is None and "target_audio" in batch and "target_audio_lengths" in batch:
                     sample_batch_for_quality = batch
 
         avg_loss = total_loss / total_samples
+        avg_main_loss = total_main_loss / total_samples
+        avg_sub_talker_loss = total_sub_talker_loss / total_samples
 
         # Speaker embedding consistency (similarity within batch)
         if len(speaker_embeddings) > 1:
@@ -826,13 +1228,15 @@ class Trainer:
         else:
             avg_similarity = 1.0
 
-        # Build metrics with all five EVALUATION_METRICS
+        # Build metrics with all five EVALUATION_METRICS plus loss breakdown
         metrics = {
             "perplexity": torch.exp(torch.tensor(avg_loss)).item() if avg_loss < 20 else float("inf"),
             "speaker_embedding_consistency": avg_similarity,
             "pronunciation_accuracy": 0.0,
             "tonal_accuracy": 0.0,
             "prosody_accuracy": 0.0,
+            "main_loss": avg_main_loss,
+            "sub_talker_loss": avg_sub_talker_loss,
         }
 
         # When we have target audio, generate audio from the model and compute all five
@@ -841,25 +1245,31 @@ class Trainer:
             try:
                 with torch.no_grad():
                     gen_wavs = self._generate_audio_from_batch(model, sample_batch_for_quality)
-                if gen_wavs is not None:
+                if gen_wavs is None:
+                    logger.warning(
+                        "Quality metrics skipped: _generate_audio_from_batch returned None "
+                        "(check codec_mask / valid_codes or speech_tokenizer availability)."
+                    )
+                else:
                     qcalc = QualityMetricsCalculator(sample_rate=24000)
                     target_audio = sample_batch_for_quality["target_audio"]
                     target_audio_lengths = sample_batch_for_quality["target_audio_lengths"]
                     B = min(len(gen_wavs), target_audio.shape[0])
-                    scores = {k: [] for k in EVALUATION_METRICS}
+                    sums = {k: 0.0 for k in EVALUATION_METRICS}
+                    counts = {k: 0 for k in EVALUATION_METRICS}
                     for i in range(B):
                         L = int(target_audio_lengths[i].item())
                         if L < 100 or i >= len(gen_wavs) or gen_wavs[i] is None or len(gen_wavs[i]) < 100:
                             continue
                         ref_np = target_audio[i, :L].float().cpu().numpy()
                         gen_np = gen_wavs[i] if isinstance(gen_wavs[i], np.ndarray) else np.array(gen_wavs[i], dtype=np.float32)
-                        # Trim or pad gen to similar length for metric (quality_metrics pads internally)
                         m = qcalc.calculate_all_metrics(gen_np, ref_np)
                         for k in EVALUATION_METRICS:
-                            scores[k].append(m[k])
+                            sums[k] += m[k]
+                            counts[k] += 1
                     for k in EVALUATION_METRICS:
-                        if scores[k]:
-                            metrics[k] = float(np.mean(scores[k]))
+                        if counts[k] > 0:
+                            metrics[k] = sums[k] / counts[k]
             except Exception as e:
                 logger.warning("Quality metrics (generated vs target_audio) failed: %s", e)
 
@@ -874,6 +1284,8 @@ class Trainer:
         if self.config.use_wandb:
             log_dict = {
                 "val/loss": avg_loss,
+                "val/main_loss": avg_main_loss,
+                "val/sub_talker_loss": avg_sub_talker_loss,
                 "val/step": step,
                 "val/epoch": epoch,
             }
@@ -882,7 +1294,7 @@ class Trainer:
             self.accelerator.log(log_dict, step=step)
 
         if self.accelerator.is_main_process:
-            print(f"Validation Loss: {avg_loss:.4f}")
+            print(f"Validation Loss: {avg_loss:.4f} (main: {avg_main_loss:.4f}, sub_talker: {avg_sub_talker_loss:.4f})")
             for k in EVALUATION_METRICS:
                 v = metrics[k]
                 if isinstance(v, float) and not np.isfinite(v):
@@ -930,10 +1342,10 @@ class Trainer:
             print(f"{'='*60}\n")
 
     def save_checkpoint(self, model, optimizer, scheduler, step, epoch, checkpoint_type):
-        """Save model checkpoint."""
+        """Save model checkpoint (I/O runs in background thread so training is not blocked)."""
         if not self.accelerator.is_main_process:
             return
-        
+
         print(f"\n{'='*60}")
         print(f"💾 Saving {checkpoint_type.upper()} Checkpoint")
         print(f"{'='*60}")
@@ -941,204 +1353,37 @@ class Trainer:
         print(f"  Epoch: {epoch + 1}/{self.config.num_epochs}")
         print(f"  Type: {checkpoint_type}")
         print(f"{'='*60}")
-        
+
         output_dir = os.path.join(self.config.output_dir, checkpoint_type)
         os.makedirs(output_dir, exist_ok=True)
-        
-        # Save model weights (access the underlying model directly)
-        state_dict = {k: v.detach().to("cpu") for k, v in model.model.state_dict().items()}
-        
-        # Count the number of layer weights being saved
-        layer_keys = [k for k in state_dict.keys() if 'talker.model.layers' in k]
-        unique_layers = set()
-        for key in layer_keys:
-            parts = key.split('.')
-            if 'layers' in parts:
-                layer_idx = parts[parts.index('layers') + 1]
-                unique_layers.add(layer_idx)
-        print(f"  Saving {len(unique_layers)} layers in checkpoint")
-        
-        # Add speaker embedding
+
+        # Copy state to CPU so training can continue (batch-compatible, GPU-free for save)
+        state_dict = {k: v.detach().to("cpu").clone() for k, v in model.model.state_dict().items()}
         if self.target_speaker_embedding is not None:
-            weight = state_dict['talker.model.codec_embedding.weight']
-            state_dict['talker.model.codec_embedding.weight'][3000] = self.target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
-        
-        # Save safetensors
-        save_path = os.path.join(output_dir, "model.safetensors")
-        save_file(state_dict, save_path)
-        print(f"✓ Saved model.safetensors")
-        
-        # Save configuration
-        config_dict = model.model.config.to_dict()
-        config_dict["tts_model_type"] = "custom_voice"
-        talker_config = config_dict.get("talker_config", {})
-        talker_config["spk_id"] = {self.config.speaker_name: 3000}
-        talker_config["spk_is_dialect"] = {self.config.speaker_name: False}
-        config_dict["talker_config"] = talker_config
-        
-        # Verify the layer count in the saved configuration
-        saved_num_layers = config_dict["talker_config"]["num_hidden_layers"]
-        actual_num_layers = len(model.model.talker.model.layers)
-        print(f"Saving checkpoint with {saved_num_layers} layers (actual: {actual_num_layers})")
-        if saved_num_layers != actual_num_layers:
-            print(f"⚠ Warning: Configuration layer count ({saved_num_layers}) doesn't match actual layers ({actual_num_layers})")
-            config_dict["talker_config"]["num_hidden_layers"] = actual_num_layers
-        
-        config_file = os.path.join(output_dir, "config.json")
-        with open(config_file, 'w', encoding='utf-8') as f:
-            json.dump(config_dict, f, indent=2, ensure_ascii=False)
-        print(f"✓ Saved config.json")
-        
-        # Save generation_config.json if available
-        if hasattr(model.model, 'generate_config') and model.model.generate_config is not None:
-            generation_config_file = os.path.join(output_dir, "generation_config.json")
-            with open(generation_config_file, 'w', encoding='utf-8') as f:
-                json.dump(model.model.generate_config, f, indent=2, ensure_ascii=False)
-            print(f"✓ Saved generation_config.json")
-        
-        # Save processor config from the loaded model (includes tokenizer files)
-        if hasattr(model.model, 'processor') and model.model.processor is not None:
-            model.model.processor.save_pretrained(output_dir)
-            print(f"✓ Saved processor and tokenizer files")
-        
-        # Save speech tokenizer separately
-        if hasattr(model.model, 'speech_tokenizer') and model.model.speech_tokenizer is not None:
-            speech_tokenizer_dir = os.path.join(output_dir, "speech_tokenizer")
-            os.makedirs(speech_tokenizer_dir, exist_ok=True)
-            # The speech_tokenizer is a wrapper, save its underlying model and feature_extractor
-            model.model.speech_tokenizer.model.save_pretrained(speech_tokenizer_dir)
-            model.model.speech_tokenizer.feature_extractor.save_pretrained(speech_tokenizer_dir)
-            print(f"✓ Saved speech_tokenizer to {speech_tokenizer_dir}")
-        
-        # Save speaker encoder for the new speaker (optional, for reference)
-        if hasattr(model.model, 'speaker_encoder') and model.model.speaker_encoder is not None:
-            speaker_encoder_dir = os.path.join(output_dir, "speaker_encoder")
-            os.makedirs(speaker_encoder_dir, exist_ok=True)
-            # Save speaker encoder config
-            speaker_encoder_config = {
-                "model_type": "qwen3_tts_speaker_encoder",
-                "speaker_name": self.config.speaker_name,
-                "speaker_embedding_dim": self.target_speaker_embedding.shape[-1] if self.target_speaker_embedding is not None else 1024
-            }
-            speaker_encoder_config_file = os.path.join(speaker_encoder_dir, "speaker_config.json")
-            with open(speaker_encoder_config_file, 'w', encoding='utf-8') as f:
-                json.dump(speaker_encoder_config, f, indent=2, ensure_ascii=False)
-            print(f"✓ Saved speaker encoder config for speaker: {self.config.speaker_name}")
-        
-        # Save training state
-        training_state = {
-            "step": step,
-            "epoch": epoch,
-            "best_val_loss": self.best_val_loss,
-            "best_val_metrics": self.best_val_metrics,
-            "config": asdict(self.config),
-        }
-        
-        state_file = os.path.join(output_dir, "training_state.json")
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(training_state, f, indent=2, ensure_ascii=False)
-        print(f"✓ Saved training_state.json")
-        
-        # List all saved files
-        print(f"\n{'='*60}")
-        print(f"Checkpoint contents:")
-        print(f"{'='*60}")
-        saved_files = []
-        for root, dirs, files in os.walk(output_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, output_dir)
-                saved_files.append(rel_path)
-                print(f"  - {rel_path}")
-        print(f"{'='*60}")
-        print(f"Total files saved: {len(saved_files)}")
-        print(f"{'='*60}\n")
-        
-        # Create a README file in the checkpoint directory
-        readme_content = f"""# Fine-Tuned Qwen3-TTS Model Checkpoint
+            weight = state_dict["talker.model.codec_embedding.weight"]
+            state_dict["talker.model.codec_embedding.weight"][3000] = self.target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
 
-## Model Information
-- **Speaker Name**: {self.config.speaker_name}
-- **Base Model**: {self.config.init_model_path}
-- **Number of Layers**: {config_dict.get('talker_config', {}).get('num_hidden_layers', 'N/A')}
-- **Hidden Size**: {config_dict.get('talker_config', {}).get('hidden_size', 'N/A')}
-- **Training Epoch**: {epoch}
-- **Training Step**: {step}
-- **Best Validation Loss**: {self.best_val_loss:.4f}
+        # Count the number of layer weights being saved (single pass)
+        unique_layers = set()
+        for k in state_dict:
+            if "talker.model.layers" not in k:
+                continue
+            parts = k.split(".")
+            if "layers" in parts:
+                unique_layers.add(parts[parts.index("layers") + 1])
+        print(f"  Saving {len(unique_layers)} layers in checkpoint")
 
-## Training Configuration
-- **Learning Rate**: {self.config.learning_rate}
-- **Batch Size**: {self.config.batch_size}
-- **Gradient Accumulation Steps**: {self.config.gradient_accumulation_steps}
-- **Weight Decay**: {self.config.weight_decay}
-- **Warmup Steps**: {self.config.warmup_steps}
-- **Speaker Encoder Frozen**: {self.config.freeze_speaker_encoder}
-- **Layer Replacement**: {self.config.replace_last_n_layers} layers replaced, {self.config.add_new_layers} layers added
-- **Original Layers Frozen**: {self.config.freeze_original_layers}
+        # Wait for previous async save to finish so we don't overlap writes
+        if self._save_checkpoint_thread is not None and self._save_checkpoint_thread.is_alive():
+            self._save_checkpoint_thread.join()
+        self._save_checkpoint_thread = threading.Thread(
+            target=_run_save_checkpoint_io,
+            args=(state_dict, output_dir, model, self, checkpoint_type, step, epoch),
+            daemon=False,
+        )
+        self._save_checkpoint_thread.start()
 
-## Files Included
-- `config.json` - Model configuration
-- `generation_config.json` - Generation parameters
-- `model.safetensors` - Model weights (includes speaker encoder weights)
-- `tokenizer_config.json` - Tokenizer configuration
-- `vocab.json` - Vocabulary file
-- `merges.txt` - BPE merges file
-- `preprocessor_config.json` - Preprocessor configuration
-- `speech_tokenizer/` - Speech tokenizer model and config
-- `speaker_encoder/speaker_config.json` - Speaker encoder configuration
-- `training_state.json` - Training state and configuration
-
-## Loading the Model
-
-```python
-from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
-
-# Load the fine-tuned model
-model = Qwen3TTSModel.from_pretrained(
-    "{output_dir}",
-    torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2"
-)
-
-# Generate speech with the new speaker
-text = "Your text here"
-ref_audio = "path/to/reference_audio.wav"
-
-wavs, sr = model.generate_voice_clone(
-    text=text,
-    language="Auto",
-    ref_audio=ref_audio,
-    ref_text="Reference text for ICL mode",
-    x_vector_only_mode=False
-)
-```
-
-## Speaker Information
-The model has been fine-tuned for speaker: **{self.config.speaker_name}**
-Speaker embedding is stored at index 3000 in the codec embedding layer.
-Speaker encoder weights are included in the checkpoint and have been fine-tuned.
-
-## Notes
-- This model uses the Qwen3-TTS tokenizer
-- The model supports streaming generation
-- For best results, use reference audio from the same speaker used during training
-- The speaker encoder has been fine-tuned to better capture speaker characteristics
-"""
-        readme_file = os.path.join(output_dir, "README.md")
-        with open(readme_file, 'w', encoding='utf-8') as f:
-            f.write(readme_content)
-        print(f"✓ Created README.md with usage instructions")
-
-        print(f"✓ Saved {checkpoint_type} checkpoint to {output_dir}")
-
-        # Upload to HuggingFace if configured
-        if checkpoint_type in ["best", "last"]:
-            if checkpoint_type == "best":
-                repo_id = self.config.hf_best_model_repo
-            else:
-                repo_id = self.config.hf_last_model_repo
-
-            self._upload_checkpoint_to_hf(output_dir, repo_id, checkpoint_type)
+        # Upload to HuggingFace is done inside _run_save_checkpoint_io after files are written
     
     def upload_to_huggingface(self):
         """Upload models to HuggingFace."""
@@ -1180,7 +1425,7 @@ Speaker encoder weights are included in the checkpoint and have been fine-tuned.
             print(f"✓ Uploaded last model to {self.config.hf_last_model_repo}")
 
     def cleanup(self):
-        """Cleanup background preprocessors."""
+        """Cleanup background preprocessors and wait for any async checkpoint save to finish."""
         print("\nCleaning up background preprocessors...")
         
         if self.train_preprocessor:
@@ -1188,23 +1433,68 @@ Speaker encoder weights are included in the checkpoint and have been fine-tuned.
         
         if self.eval_preprocessor:
             self.eval_preprocessor.stop()
+
+        if self._save_checkpoint_thread is not None and self._save_checkpoint_thread.is_alive():
+            self._save_checkpoint_thread.join()
+            self._save_checkpoint_thread = None
         
         print("✓ Cleanup complete")
 
 
+def _clear_all_caches() -> None:
+    """Clear GPU and in-process caches to free memory (avoids OOM from fragmentation or previous runs)."""
+    REF_MEL_DEVICE_CACHE.clear()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def _move_speech_tokenizer_decoder_to_cpu(model: Any) -> None:
+    """Move only speech_tokenizer.decoder to CPU to save VRAM; decode() handles device transfer."""
+    if not getattr(model, "model", None):
+        return
+    st = getattr(model.model, "speech_tokenizer", None)
+    if st is None or getattr(st, "model", None) is None:
+        return
+    dec = getattr(st.model, "decoder", None)
+    if dec is not None:
+        dec.to("cpu")
+        logger.info("speech_tokenizer.decoder moved to CPU (encoder stays on GPU)")
+
+
 def main():
     """Main training function."""
+    # Reduce CUDA fragmentation (PyTorch recommendation when OOM with "reserved but unallocated")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     print("="*60)
     print("Qwen3-TTS Training Pipeline")
     print("="*60)
-    
+
+    # Clear all caches so training starts with a clean state (avoids OOM)
+    _clear_all_caches()
+    print("  All caches cleared (REF_MEL_DEVICE_CACHE + GPU)")
+
     # Load configuration
     config = TrainingConfig()
     
-    # Print configuration
+    # Set DataLoader multiprocessing start method before any workers are created.
+    # Use spawn when tokenizer/audio codes run on CUDA (fork + CUDA is unsafe); otherwise fork is fine.
+    _effective = config.dataloader_multiprocessing_start_method
+    if _effective == "auto":
+        _effective = "spawn" if (torch.cuda.is_available() and not config.use_cpu_for_tokenizer_audio_codes) else "fork"
+    if _effective not in ("fork", "spawn", "forkserver"):
+        _effective = "fork"
+    try:
+        multiprocessing.set_start_method(_effective, force=False)
+        print(f"  DataLoader multiprocessing start method: {_effective}")
+    except RuntimeError:
+        pass  # already set
+    
+    # Print configuration (iterate fields without building full dict)
     print("\nConfiguration:")
-    for key, value in asdict(config).items():
-        print(f"  {key}: {value}")
+    for f in fields(config):
+        print(f"  {f.name}: {getattr(config, f.name)}")
     
     # Step 1: Prepare data
     data_processor = DataProcessor(config)
@@ -1213,6 +1503,10 @@ def main():
     # Step 2: Load model
     trainer = Trainer(config)
     model = trainer.load_model()
+
+    # Optionally move only speech_tokenizer.decoder to CPU (saves VRAM; max workers with data tokenizer on CPU)
+    if config.speech_tokenizer_decoder_on_cpu:
+        _move_speech_tokenizer_decoder_to_cpu(model)
     
     # Step 3: Get dataloaders
     config_obj = AutoConfig.from_pretrained(config.init_model_path)
@@ -1223,7 +1517,10 @@ def main():
     speakers_list = [s.strip() for s in config.train_speakers.split(",") if s.strip()]
     if speakers_list:
         load_speaker_refs(speakers_list)
-    
+
+    # Print data used and how long to train
+    _training_summary(config, train_dataloader)
+
     # Step 4: Train
     trainer.train(model, train_dataloader, eval_dataloader)
 

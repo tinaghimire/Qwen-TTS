@@ -7,7 +7,7 @@ For **multi-speaker fine-tuning** (two speakers, one dataset upload, CUDA batchi
 Quick reference:
 
 1. **Data preparation (once):**  
-   `uv run python finetuning/data_preparation.py --speaker both --upload --repo_id "YOUR_USER/qwen3-tts-multi-speaker"`
+   `uv run python finetuning/data_preparation.py --speaker both --upload --repo_id "vaghawan/qwen3-tts-multi-speaker"`
 
 2. **Fine-tuning:**  
    `uv run python finetuning/finetune.py`  
