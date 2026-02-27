@@ -212,20 +212,12 @@ def _run_save_checkpoint_io(
         train_speakers_list = [trainer.config.speaker_name.lower()]
     talker_config["spk_id"] = {name: 3000 for name in train_speakers_list}
     talker_config["spk_is_dialect"] = {name: False for name in train_speakers_list}
+    # Preserve codec_language_id from the base model without adding new languages;
+    # this keeps whatever English mapping exists but does not inject Hausa or others.
     tc_obj = getattr(model.model.config, "talker_config", None)
-    codec_lang = talker_config.get("codec_language_id")
+    codec_lang = {}
     if isinstance(tc_obj, object) and getattr(tc_obj, "codec_language_id", None) and isinstance(tc_obj.codec_language_id, dict):
         codec_lang = dict(tc_obj.codec_language_id)
-    if not isinstance(codec_lang, dict):
-        codec_lang = {}
-    english_id = codec_lang.get("english")
-    if english_id is None and codec_lang:
-        english_id = next(iter(codec_lang.values()), None)
-    if english_id is not None:
-        if "english" not in codec_lang:
-            codec_lang["english"] = english_id
-        if "hausa" not in codec_lang:
-            codec_lang["hausa"] = english_id
     talker_config["codec_language_id"] = codec_lang
     config_dict["talker_config"] = talker_config
     saved_num_layers = config_dict["talker_config"]["num_hidden_layers"]

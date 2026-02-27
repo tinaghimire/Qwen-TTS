@@ -16,7 +16,6 @@ Data shape (train and validation):
   - text: transcript.
   - speaker: subset name (e.g. hausa_speaker) for ref lookup.
   - audio_codes: from 12Hz tokenizer on target_audio (training targets).
-  - language: language tag for this speaker (e.g. hausa_speaker → "hausa", english_speaker → "english).
     Used for inference/generation; base model may not support "hausa" (use LANGUAGE_FOR_HAUSA in .env).
   - Ref audio: not stored per row; finetune.py loads from voices/{speaker}.wav once per speaker
     (REF_AUDIO_CACHE / REF_MEL_CACHE) and passes ref_mels in the batch for speaker
@@ -72,10 +71,6 @@ MAX_VAL_SAMPLES = int(os.getenv("MAX_VAL_SAMPLES", "15000")) if os.getenv("MAX_V
 # Speaker → language for conditioning (hausa_speaker → Hausa, english_speaker → English).
 # Base Qwen3-TTS may not list "hausa"; use LANGUAGE_FOR_HAUSA in .env for inference fallback.
 # To accept language="hausa" in generation: extend talker config (codec_language_id + token id / embeddings). For now, hausa_speaker + LANGUAGE_FOR_HAUSA=english is supported. During fine-tuning the model learns language conditioning via the codec prefill (think path + language_id) below.
-SPEAKER_LANGUAGE: Dict[str, str] = {
-    "hausa_speaker": "hausa",
-    "english_speaker": "english",
-}
 
 # Optional extra Hausa data: CSV (transcript, audio_filename) + directory of WAVs. Used in addition to HF hausa_speaker.
 def _hausa_extra_paths() -> Tuple[Optional[str], Optional[str]]:
@@ -86,16 +81,6 @@ def _hausa_extra_paths() -> Tuple[Optional[str], Optional[str]]:
     if os.path.isfile(csv_path) and os.path.isdir(audio_dir):
         return csv_path, audio_dir
     return None, None
-
-
-def _resolve_language_codec_id(language: str, talker_config: Any) -> Optional[int]:
-    """Resolve language name to codec_language_id token for training. Returns None to use nothink path."""
-    if not getattr(talker_config, "codec_language_id", None) or not isinstance(talker_config.codec_language_id, dict):
-        return None
-    lang = (language or "english").strip().lower()
-    if lang == "hausa":
-        lang = (os.getenv("LANGUAGE_FOR_HAUSA") or "english").strip().lower()
-    return talker_config.codec_language_id.get(lang)
 
 
 def get_device_for_current_process() -> str:
@@ -337,7 +322,7 @@ class LocalHausaCSVDataset(TorchDataset):
             "audio_codes": audio_codes,
             "sr": audio_sr,
             "speaker": self.speaker,
-            "language": SPEAKER_LANGUAGE.get(self.speaker, "hausa"),
+            "language": SPEAKER_LANGUAGE.get(self.speaker, "english"),
         }
 
 
@@ -452,7 +437,6 @@ class MultiSpeakerStreamingTTSDataset(TorchDataset):
 
             # Language conditioning: use think path + language_id when supported so the model learns language
             lang = data.get("language", SPEAKER_LANGUAGE.get(data["speaker"], "english"))
-            language_id = _resolve_language_codec_id(lang, self.config.talker_config)
             tc = self.config.talker_config
             if language_id is not None:
                 # [codec_think_id, codec_think_bos_id, language_id, 0 (speaker slot), codec_think_eos_id]
