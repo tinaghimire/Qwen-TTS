@@ -8,6 +8,8 @@ Used by finetune.py only.
 Data shape (train and validation):
   - Both speakers (e.g. hausa_speaker, english_speaker) are combined into one dataset;
     each row has: target_audio, text, speaker, audio_codes.
+  - For hausa_speaker, additional local data is included in the *train* split only when present: CSV at
+    data/hausa-mtn-test.csv (transcript, audio file id) and WAVs in data/provided-test-speech/ (override with HAUSA_EXTRA_CSV / HAUSA_EXTRA_AUDIO_DIR).
   - target_audio: ground-truth waveform for this utterance → used for reconstruction
     loss, pauses, pronunciation, tone/pitch (dual_loss_trainer). Also converted to
     target_mel for mel losses.
@@ -27,6 +29,7 @@ For data preparation and upload (CLI), run:
 """
 
 import base64
+import csv
 import io
 import os
 import sys
@@ -73,6 +76,16 @@ SPEAKER_LANGUAGE: Dict[str, str] = {
     "hausa_speaker": "hausa",
     "english_speaker": "english",
 }
+
+# Optional extra Hausa data: CSV (transcript, audio_filename) + directory of WAVs. Used in addition to HF hausa_speaker.
+def _hausa_extra_paths() -> Tuple[Optional[str], Optional[str]]:
+    """Return (csv_path, audio_dir) for local Hausa MTN test data; (None, None) if not present."""
+    _data_root = os.path.join(project_root, "data")
+    csv_path = os.getenv("HAUSA_EXTRA_CSV") or os.path.join(_data_root, "hausa-mtn-test.csv")
+    audio_dir = os.getenv("HAUSA_EXTRA_AUDIO_DIR") or os.path.join(_data_root, "provided-test-speech")
+    if os.path.isfile(csv_path) and os.path.isdir(audio_dir):
+        return csv_path, audio_dir
+    return None, None
 
 
 def _resolve_language_codec_id(language: str, talker_config: Any) -> Optional[int]:
@@ -245,6 +258,86 @@ class MultiSpeakerTTSDataLoader(TorchDataset):
             "sr": audio_sr,
             "speaker": self.subset,
             "language": SPEAKER_LANGUAGE.get(self.subset, "english"),
+        }
+
+
+class LocalHausaCSVDataset(TorchDataset):
+    """
+    Load hausa_speaker samples from a local CSV (transcript, audio filename) and audio directory.
+    Same output shape as MultiSpeakerTTSDataLoader for use with MultiSpeakerStreamingTTSDataset collate.
+    CSV format: header row, then rows with transcript and audio file id (e.g. "1" for 1.wav).
+    """
+
+    def __init__(
+        self,
+        csv_path: str,
+        audio_dir: str,
+        speaker: str = "hausa_speaker",
+        tokenizer_path: str = TOKENIZER_PATH,
+        max_samples: Optional[int] = None,
+        device: Optional[str] = None,
+    ):
+        self.csv_path = csv_path
+        self.audio_dir = audio_dir
+        self.speaker = speaker
+        self.tokenizer_path = tokenizer_path
+        self.max_samples = max_samples
+        self.device = (device or "cpu").lower()
+        if self.device not in ("cpu", "cuda"):
+            self.device = "cpu"
+
+        self.rows: List[Tuple[str, str]] = []  # (text, audio_basename)
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            for row in reader:
+                if len(row) >= 2 and row[0].strip() and row[1].strip():
+                    text = row[0].strip()
+                    audio_key = row[1].strip()
+                    self.rows.append((text, audio_key))
+        if max_samples is not None:
+            self.rows = self.rows[: max_samples]
+        self.tokenizer = Qwen3TTSTokenizer.from_pretrained(tokenizer_path, device_map=self.device)
+        print(f"  Local Hausa CSV: {len(self.rows)} samples from {csv_path} + {audio_dir}")
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def _resolve_audio_path(self, audio_basename: str) -> Optional[str]:
+        """Resolve audio file path; try with and without .wav extension."""
+        for name in (f"{audio_basename}.wav", audio_basename, f"{audio_basename}.mp3"):
+            p = os.path.join(self.audio_dir, name)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        text, audio_key = self.rows[idx]
+        audio_path = self._resolve_audio_path(audio_key)
+        if audio_path is None:
+            raise FileNotFoundError(f"Audio not found for key '{audio_key}' in {self.audio_dir}")
+        target_audio, audio_sr = sf.read(audio_path, dtype="float32")
+        if target_audio.ndim > 1:
+            target_audio = np.mean(target_audio, axis=-1)
+        target_audio = target_audio.astype(np.float32)
+        if audio_sr != 24000:
+            import librosa
+            target_audio = librosa.resample(target_audio, orig_sr=audio_sr, target_sr=24000)
+            audio_sr = 24000
+        with torch.no_grad():
+            enc_result = self.tokenizer.encode([target_audio], sr=audio_sr)
+            ac = enc_result.audio_codes[0]
+            if hasattr(ac, "cpu"):
+                audio_codes = ac.cpu().numpy()
+            else:
+                audio_codes = np.array(ac, dtype=np.int64)
+        return {
+            "target_audio": target_audio,
+            "text": text,
+            "audio_codes": audio_codes,
+            "sr": audio_sr,
+            "speaker": self.speaker,
+            "language": SPEAKER_LANGUAGE.get(self.speaker, "hausa"),
         }
 
 
@@ -640,8 +733,10 @@ def get_multispeaker_finetune_dataloader(
     else:
         from torch.utils.data import ConcatDataset
 
-        datasets_list = [
-            MultiSpeakerTTSDataLoader(
+        hausa_extra_csv, hausa_extra_audio_dir = _hausa_extra_paths()
+        datasets_list: List[TorchDataset] = []
+        for sp in speakers:
+            ds = MultiSpeakerTTSDataLoader(
                 repo_id=repo_id,
                 subset=sp,
                 split=split,
@@ -650,8 +745,18 @@ def get_multispeaker_finetune_dataloader(
                 device=tokenizer_device,
                 cache_dir=cache_dir,
             )
-            for sp in speakers
-        ]
+            if sp == "hausa_speaker" and split == "train" and hausa_extra_csv and hausa_extra_audio_dir:
+                extra_ds = LocalHausaCSVDataset(
+                    csv_path=hausa_extra_csv,
+                    audio_dir=hausa_extra_audio_dir,
+                    speaker="hausa_speaker",
+                    tokenizer_path=tokenizer_path,
+                    max_samples=None,
+                    device=tokenizer_device,
+                )
+                ds = ConcatDataset([ds, extra_ds])
+                print(f"  Added {len(extra_ds)} local Hausa samples (hausa-mtn-test.csv + provided-test-speech)")
+            datasets_list.append(ds)
         combined = ConcatDataset(datasets_list)
         wrapper = MultiSpeakerStreamingTTSDataset(combined, processor, config, speaker_list=speakers)
         dataset_for_dl = wrapper
@@ -685,7 +790,8 @@ def get_multispeaker_finetune_dataloader(
         dl_kwargs["persistent_workers"] = True
 
     dl = TorchDataLoader(dataset_for_dl, **dl_kwargs)
-    sample_info = f"streaming, speakers={speakers}" if use_streaming else f"{len(combined) if not use_streaming else '?'} samples, speakers={speakers}"
+    _total_samples = len(combined) if not use_streaming else "?"
+    sample_info = f"streaming, speakers={speakers}" if use_streaming else f"{_total_samples} samples, speakers={speakers}"
     print(f"✓ Multi-speaker DataLoader: {sample_info}, split={split}, "
           f"num_workers={num_workers}, prefetch_factor={prefetch_factor if use_prefetch else 'N/A'}, "
           f"persistent_workers={use_persistent}")

@@ -357,12 +357,12 @@ class TrainingConfig:
     
     # Data: HuggingFace combined multi-speaker only
     hf_dataset_repo: str = os.getenv("HF_DATASET_REPO", "vaghawan/qwen3-tts-multi-speaker")
-    train_speakers: str = os.getenv("TRAIN_SPEAKERS", "hausa_speaker,english_speaker")
+    train_speakers: str = os.getenv("TRAIN_SPEAKERS", "hausa_speaker")  # Only hausa_speaker; set "hausa_speaker,english_speaker" for both
 
     # Model Configuration - Paths to models and tokenizer
     init_model_path: str = os.getenv("INIT_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")  # Base model path (12Hz or 25Hz model)
-    # Optional: HF repo with only model.safetensors (e.g. vaghawan/tts-600k-last). Weights are loaded after init_model_path; missing configs use init_model_path defaults.
-    checkpoint_weights_repo: Optional[str] = os.getenv("CHECKPOINT_WEIGHTS_REPO") or None
+    # Optional: HF repo with model.safetensors; loaded after init_model_path (e.g. vaghawan/tts-last). Set to empty to skip.
+    checkpoint_weights_repo: Optional[str] = os.getenv("CHECKPOINT_WEIGHTS_REPO", "vaghawan/tts-last") or None
     tokenizer_path: str = os.getenv("TOKENIZER_PATH", "Qwen/Qwen3-TTS-Tokenizer-12Hz")  # Tokenizer path (12Hz or 25Hz)
     output_dir: str = os.getenv("OUTPUT_DIR", "./output")  # Directory for checkpoints and logs
     speaker_name: str = os.getenv("SPEAKER_NAME", "reference_speaker")  # Speaker name for fine-tuning
