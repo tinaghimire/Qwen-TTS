@@ -9,7 +9,11 @@ Data flow (only supported path):
    ref_audio comes from voices/ (hausa_speaker.wav, english_speaker.wav); audio_codes from tokenizer on the fly.
 3. Combined train/val dataloaders via get_multispeaker_finetune_dataloader (batch- and CUDA-friendly).
 
-Multi-GPU: accelerate launch --num_processes=N train.py
+To start from a custom checkpoint (e.g. vaghawan/tts-600k-last) that lacks config files:
+  Set INIT_MODEL_PATH=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice and CHECKPOINT_WEIGHTS_REPO=vaghawan/tts-600k-last in .env.
+  The script loads the base model first (for configs/processor/speech_tokenizer), then applies the checkpoint weights.
+
+Multi-GPU: accelerate launch --num_processes=N finetune.py
 """
 
 import json
@@ -357,6 +361,8 @@ class TrainingConfig:
 
     # Model Configuration - Paths to models and tokenizer
     init_model_path: str = os.getenv("INIT_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")  # Base model path (12Hz or 25Hz model)
+    # Optional: HF repo with only model.safetensors (e.g. vaghawan/tts-600k-last). Weights are loaded after init_model_path; missing configs use init_model_path defaults.
+    checkpoint_weights_repo: Optional[str] = os.getenv("CHECKPOINT_WEIGHTS_REPO") or None
     tokenizer_path: str = os.getenv("TOKENIZER_PATH", "Qwen/Qwen3-TTS-Tokenizer-12Hz")  # Tokenizer path (12Hz or 25Hz)
     output_dir: str = os.getenv("OUTPUT_DIR", "./output")  # Directory for checkpoints and logs
     speaker_name: str = os.getenv("SPEAKER_NAME", "reference_speaker")  # Speaker name for fine-tuning
@@ -627,6 +633,15 @@ class Trainer:
                 **load_kwargs,
             )
             print(f"✓ Model loaded with SDPA")
+        
+        # Optionally load weights from a checkpoint repo (e.g. vaghawan/tts-600k-last) before finetuning. Uses default configs from init_model_path for missing files.
+        if getattr(self.config, "checkpoint_weights_repo", None):
+            _finetuning_root = Path(__file__).resolve().parent.parent.parent
+            if str(_finetuning_root) not in sys.path:
+                sys.path.insert(0, str(_finetuning_root))
+            from load_custom_checkpoint import apply_checkpoint_weights
+            print(f"\nApplying checkpoint weights from: {self.config.checkpoint_weights_repo}")
+            apply_checkpoint_weights(model, self.config.checkpoint_weights_repo, verbose=True)
         
         # Model will be cast to bf16 by accelerator, no manual casting needed
         print(f"✓ Model ready for bf16 mixed precision training")
